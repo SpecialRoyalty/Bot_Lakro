@@ -11,14 +11,18 @@ class ConfigError(ValueError):
     """Raised when a required environment variable is missing or invalid."""
 
 
-def _parse_admin_ids(raw: str) -> frozenset[int]:
+def _parse_user_ids(raw: str, variable: str, *, required: bool) -> frozenset[int]:
     values = [part for part in re.split(r"[\s,;]+", raw.strip()) if part]
     if not values:
-        raise ConfigError("ADMIN_IDS doit contenir au moins un identifiant Telegram.")
+        if required:
+            raise ConfigError(f"{variable} doit contenir au moins un identifiant Telegram.")
+        return frozenset()
     try:
         return frozenset(int(value) for value in values)
     except ValueError as exc:
-        raise ConfigError("ADMIN_IDS doit contenir uniquement des nombres séparés par des virgules.") from exc
+        raise ConfigError(
+            f"{variable} doit contenir uniquement des nombres séparés par des virgules."
+        ) from exc
 
 
 @dataclass(frozen=True, slots=True)
@@ -26,6 +30,7 @@ class Config:
     bot_token: str
     target_chat_id: int
     admin_ids: frozenset[int]
+    trusted_ids: frozenset[int]
     group_invite_link: str
     timezone: ZoneInfo
     timezone_name: str
@@ -68,7 +73,8 @@ class Config:
         return cls(
             bot_token=token,
             target_chat_id=chat_id,
-            admin_ids=_parse_admin_ids(os.getenv("ADMIN_IDS", "")),
+            admin_ids=_parse_user_ids(os.getenv("ADMIN_IDS", ""), "ADMIN_IDS", required=True),
+            trusted_ids=_parse_user_ids(os.getenv("TRUSTED_IDS", ""), "TRUSTED_IDS", required=False),
             group_invite_link=os.getenv("GROUP_INVITE_LINK", "").strip(),
             timezone=timezone,
             timezone_name=timezone_name,

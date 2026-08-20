@@ -27,6 +27,14 @@ def _normalize(value: str) -> str:
     return " ".join(unicodedata.normalize("NFKC", value).casefold().split())
 
 
+def is_popular_justice_signal(text: str) -> bool:
+    """Recognize only a standalone pedo/pdo report, accents and case ignored."""
+    decomposed = unicodedata.normalize("NFKD", text).casefold()
+    without_accents = "".join(char for char in decomposed if not unicodedata.combining(char))
+    compact = re.sub(r"[^a-z0-9]+", "", without_accents)
+    return compact in {"pedo", "pdo"}
+
+
 def find_banned_word(text: str, banned_words: Iterable[str]) -> str | None:
     normalized_text = _normalize(text)
     for word in banned_words:

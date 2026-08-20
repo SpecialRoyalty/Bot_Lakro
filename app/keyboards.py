@@ -19,6 +19,8 @@ def panel_text(
     auto_open: bool,
     links_forbidden: bool,
     forwards_forbidden: bool,
+    popular_justice: bool,
+    popular_threshold: int,
     schedule: DailySchedule,
     timezone_name: str,
 ) -> str:
@@ -29,19 +31,31 @@ def panel_text(
         f"Ouverture automatique : {_state_label(auto_open)}\n"
         f"Liens interdits : {_state_label(links_forbidden)}\n"
         f"Transferts interdits : {_state_label(forwards_forbidden)}\n"
+        f"Justice populaire : {_state_label(popular_justice)} (seuil : {popular_threshold})\n"
         f"Horaire : {format_hhmm(schedule.opens_at)} → {format_hhmm(schedule.closes_at)}\n"
         f"Fuseau : {timezone_name}\n\n"
         "Seuls les ADMIN_IDS définis dans Railway peuvent utiliser ces boutons."
     )
 
 
-def panel_keyboard(*, auto_open: bool, links_forbidden: bool, forwards_forbidden: bool) -> dict[str, Any]:
+def panel_keyboard(
+    *,
+    auto_open: bool,
+    links_forbidden: bool,
+    forwards_forbidden: bool,
+    popular_justice: bool,
+    popular_threshold: int,
+) -> dict[str, Any]:
     return {
         "inline_keyboard": [
             [_button(f"Automatique {_state_label(auto_open)}", "toggle:auto")],
             [
                 _button(f"Liens {_state_label(links_forbidden)}", "toggle:links"),
                 _button(f"Forwards {_state_label(forwards_forbidden)}", "toggle:forwards"),
+            ],
+            [
+                _button(f"Justice {_state_label(popular_justice)}", "toggle:justice"),
+                _button(f"Seuil : {popular_threshold}", "justice:threshold"),
             ],
             [_button("🚫 Mots interdits", "words:menu"), _button("📜 Règles", "rules:menu")],
             [_button("🕒 Horaires", "schedule:menu"), _button("🔄 Resynchroniser", "sync")],
@@ -84,4 +98,3 @@ def schedule_keyboard() -> dict[str, Any]:
 
 def cancel_keyboard() -> dict[str, Any]:
     return {"inline_keyboard": [[_button("Annuler", "cancel")]]}
-

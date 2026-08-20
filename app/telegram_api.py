@@ -99,6 +99,11 @@ class TelegramAPI:
     def delete_message(self, chat_id: int, message_id: int) -> bool:
         return bool(self.call("deleteMessage", {"chat_id": chat_id, "message_id": message_id}))
 
+    def delete_messages(self, chat_id: int, message_ids: list[int]) -> bool:
+        if not 1 <= len(message_ids) <= 100:
+            raise ValueError("deleteMessages accepte entre 1 et 100 identifiants.")
+        return bool(self.call("deleteMessages", {"chat_id": chat_id, "message_ids": message_ids}))
+
     def answer_callback_query(self, callback_query_id: str, text: str = "", *, alert: bool = False) -> bool:
         payload: dict[str, Any] = {"callback_query_id": callback_query_id, "show_alert": alert}
         if text:
@@ -109,7 +114,7 @@ class TelegramAPI:
         return dict(self.call("getChat", {"chat_id": chat_id}))
 
     def get_chat_administrators(self, chat_id: int) -> list[dict[str, Any]]:
-        return list(self.call("getChatAdministrators", {"chat_id": chat_id, "return_bots": True}))
+        return list(self.call("getChatAdministrators", {"chat_id": chat_id}))
 
     def get_chat_member(self, chat_id: int, user_id: int) -> dict[str, Any]:
         return dict(self.call("getChatMember", {"chat_id": chat_id, "user_id": user_id}))

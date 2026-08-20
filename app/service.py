@@ -35,6 +35,7 @@ from app.moderation import (
     is_allowed_open_content,
     is_forward,
     is_membership_event,
+    is_popular_justice_signal,
     is_story,
     sender_user_id,
 )
@@ -50,6 +51,13 @@ SCHEDULE_PRESETS = {
     "2300-0200": ("23:00", "02:00"),
     "0000-0300": ("00:00", "03:00"),
 }
+TRUSTED_COMMANDS = {"/supprime", "/pasfr", "/ban"}
+POPULAR_THRESHOLD_MIN = 2
+POPULAR_THRESHOLD_MAX = 50
+
+
+class StartupError(RuntimeError):
+    """Configuration error that should be shown without a noisy traceback."""
 
 
 @dataclass(slots=True)
@@ -94,25 +102,38 @@ class GroupManagerService:
         }
 
     def run(self) -> None:
-        self.storage.initialize()
-        self.api.delete_webhook(drop_pending_updates=True)
-        me = self.api.get_me()
-        self._bot_id = int(me["id"])
-        self._bot_username = str(me.get("username") or me.get("first_name") or self._bot_id)
-        self._validate_target_chat()
-        self._refresh_group_admins(strict=True)
-        self._validate_bot_rights()
-
-        self.health_server.start()
-        self._scheduler_thread = threading.Thread(
-            target=self._scheduler_loop,
-            name="group-scheduler",
-            daemon=True,
-        )
-        self._scheduler_thread.start()
-        LOGGER.info("Bot @%s démarré pour le groupe %s", self._bot_username, self.config.target_chat_id)
-
         try:
+            self.storage.initialize()
+            try:
+                self.api.delete_webhook(drop_pending_updates=True)
+                me = self.api.get_me()
+            except TelegramAPIError as exc:
+                raise StartupError(
+                    "Impossible d’identifier le bot. Vérifiez que BOT_TOKEN est complet et valide. "
+                    f"Détail Telegram : {exc.description}"
+                ) from exc
+
+            self._bot_id = int(me["id"])
+            self._bot_username = str(me.get("username") or me.get("first_name") or self._bot_id)
+            self._validate_target_chat()
+            try:
+                admins = self._refresh_group_admins(strict=True)
+                self._validate_bot_rights(admins)
+            except TelegramAPIError as exc:
+                raise StartupError(
+                    "Impossible de lire les administrateurs du groupe. Vérifiez que le bot est déjà "
+                    f"administrateur de TARGET_CHAT_ID={self.config.target_chat_id}. "
+                    f"Détail Telegram : {exc.description}"
+                ) from exc
+
+            self.health_server.start()
+            self._scheduler_thread = threading.Thread(
+                target=self._scheduler_loop,
+                name="group-scheduler",
+                daemon=True,
+            )
+            self._scheduler_thread.start()
+            LOGGER.info("Bot @%s démarré pour le groupe %s", self._bot_username, self.config.target_chat_id)
             self._poll_updates()
         finally:
             self.stop_event.set()
@@ -123,19 +144,33 @@ class GroupManagerService:
         self.stop_event.set()
 
     def _validate_target_chat(self) -> None:
-        chat = self.api.get_chat(self.config.target_chat_id)
+        try:
+            chat = self.api.get_chat(self.config.target_chat_id)
+        except TelegramAPIError as exc:
+            if exc.error_code == 400 and "chat not found" in exc.description.lower():
+                raise StartupError(
+                    f"Telegram ne trouve pas TARGET_CHAT_ID={self.config.target_chat_id}. "
+                    "Utilisez l’identifiant numérique du supergroupe (il commence généralement par -100), "
+                    f"ajoutez @{self._bot_username or 'le bot'} à ce groupe comme administrateur et vérifiez "
+                    "que BOT_TOKEN appartient bien à ce même bot."
+                ) from exc
+            raise StartupError(
+                f"Impossible d’accéder à TARGET_CHAT_ID={self.config.target_chat_id}. "
+                f"Détail Telegram : {exc.description}"
+            ) from exc
         if chat.get("type") not in {"group", "supergroup"}:
-            raise RuntimeError("TARGET_CHAT_ID doit désigner un groupe ou un supergroupe Telegram.")
+            raise StartupError("TARGET_CHAT_ID doit désigner un groupe ou un supergroupe Telegram.")
         if not self._invite_link_cache:
             self._invite_link_cache = str(chat.get("invite_link") or "")
 
-    def _validate_bot_rights(self) -> None:
+    def _validate_bot_rights(self, admins: list[dict[str, Any]] | None = None) -> None:
         if self._bot_id is None:
-            raise RuntimeError("Identité du bot indisponible.")
-        admins = self.api.get_chat_administrators(self.config.target_chat_id)
+            raise StartupError("Identité du bot indisponible.")
+        if admins is None:
+            admins = self.api.get_chat_administrators(self.config.target_chat_id)
         entry = next((item for item in admins if int((item.get("user") or {}).get("id", 0)) == self._bot_id), None)
         if not entry:
-            raise RuntimeError("Le bot doit être administrateur du groupe.")
+            raise StartupError("Le bot doit être administrateur du groupe.")
         if entry.get("status") != "creator":
             missing = [
                 label
@@ -146,7 +181,7 @@ class GroupManagerService:
                 if not entry.get(field)
             ]
             if missing:
-                raise RuntimeError("Droits administrateur manquants pour le bot : " + ", ".join(missing) + ".")
+                raise StartupError("Droits administrateur manquants pour le bot : " + ", ".join(missing) + ".")
 
     def _poll_updates(self) -> None:
         offset: int | None = None
@@ -213,10 +248,32 @@ class GroupManagerService:
 
     def _handle_group_message(self, message: dict[str, Any]) -> None:
         user_id = sender_user_id(message)
+        media_group_id = str(message.get("media_group_id") or "")
+        if media_group_id and user_id is not None:
+            self.storage.record_media_group_message(
+                media_group_id,
+                int(message["message_id"]),
+                user_id,
+            )
+
+        command = self._group_command(message)
+        if command in TRUSTED_COMMANDS:
+            self._handle_trusted_command(message, command, user_id)
+            return
+
         now = datetime.now(self.config.timezone)
         schedule = self._schedule()
         is_open_now = is_effectively_open(self.storage.get_bool("auto_open"), schedule, now)
+        if (
+            is_open_now
+            and self.storage.get_bool("popular_justice")
+            and self._handle_popular_justice_report(message, user_id)
+        ):
+            return
+
         matched_word = find_banned_word(extract_text(message), self.storage.list_words())
+        if user_id in self.config.trusted_ids:
+            matched_word = None
         membership_event = is_membership_event(message)
         action = decide_message_action(
             MessagePolicyContext(
@@ -256,6 +313,187 @@ class GroupManagerService:
             self._ban_sender(message, reason=reason)
         elif action is ModerationAction.SANCTION and matched_word and user_id is not None:
             self._sanction_forbidden_word(message, user_id, matched_word)
+
+    def _group_command(self, message: dict[str, Any]) -> str:
+        text = extract_text(message).strip()
+        if not text.startswith("/"):
+            return ""
+        return text.split(maxsplit=1)[0].split("@", maxsplit=1)[0].lower()
+
+    def _handle_trusted_command(
+        self,
+        message: dict[str, Any],
+        command: str,
+        operator_user_id: int | None,
+    ) -> None:
+        self._safe_delete(message)
+        if operator_user_id not in self.config.admin_ids | self.config.trusted_ids:
+            return
+
+        target = message.get("reply_to_message") or {}
+        if not target or not target.get("message_id"):
+            return
+
+        if command == "/supprime":
+            self._safe_delete_ids(self._target_message_ids(target))
+            return
+
+        target_user = target.get("from") or {}
+        target_user_id = sender_user_id(target)
+        if (
+            target_user_id is None
+            or target_user_id == operator_user_id
+            or target_user_id == self._bot_id
+            or target_user.get("is_bot")
+        ):
+            return
+
+        member_status = self._moderation_member_status(target_user_id)
+        if member_status != "regular":
+            return
+
+        display_name = str(target_user.get("first_name") or target_user_id)
+        if command == "/ban":
+            try:
+                self.api.ban_chat_member(self.config.target_chat_id, target_user_id)
+                self._safe_delete_ids(self._target_message_ids(target))
+                self.api.send_message(
+                    self.config.target_chat_id,
+                    f"{display_name} a été banni par la modération.",
+                )
+                LOGGER.info("Bannissement par commande de %s par %s", target_user_id, operator_user_id)
+            except TelegramAPIError:
+                LOGGER.exception("Échec du bannissement par commande pour %s", target_user_id)
+            return
+
+        if command == "/pasfr":
+            level = self.storage.register_trusted_offense(target_user_id)
+            try:
+                if level == 1:
+                    duration = timedelta(hours=1)
+                    label = "1 heure"
+                elif level == 2:
+                    duration = timedelta(days=1)
+                    label = "1 jour"
+                elif level == 3:
+                    duration = timedelta(days=5)
+                    label = "5 jours"
+                else:
+                    self.api.ban_chat_member(self.config.target_chat_id, target_user_id)
+                    self.api.send_message(
+                        self.config.target_chat_id,
+                        f"{display_name} a été banni après plusieurs sanctions.",
+                    )
+                    LOGGER.info("Bannissement /pasfr de %s au niveau %s", target_user_id, level)
+                    return
+
+                until = int((datetime.now(timezone.utc) + duration).timestamp())
+                self.api.restrict_chat_member(self.config.target_chat_id, target_user_id, until)
+                self.api.send_message(
+                    self.config.target_chat_id,
+                    f"{display_name} ne peut plus écrire pendant {label}.",
+                )
+                LOGGER.info("Sanction /pasfr de %s au niveau %s", target_user_id, level)
+            except TelegramAPIError:
+                LOGGER.exception("Échec de la sanction /pasfr pour %s", target_user_id)
+
+    def _handle_popular_justice_report(
+        self,
+        message: dict[str, Any],
+        voter_user_id: int | None,
+    ) -> bool:
+        if message.get("text") is None or not is_popular_justice_signal(extract_text(message)):
+            return False
+        target = message.get("reply_to_message") or {}
+        if not target or not target.get("message_id"):
+            return False
+
+        voter = message.get("from") or {}
+        target_user = target.get("from") or {}
+        target_user_id = sender_user_id(target)
+        if (
+            voter_user_id is None
+            or voter.get("is_bot")
+            or target_user_id is None
+            or target_user.get("is_bot")
+            or target_user_id == voter_user_id
+            or target_user_id == self._bot_id
+            or self._is_privileged(target, target_user_id)
+        ):
+            self._safe_delete(message)
+            return True
+
+        target_key = self._popular_target_key(target)
+        vote_count, added, resolved = self.storage.register_popular_vote(
+            target_key,
+            voter_user_id,
+            int(message["message_id"]),
+        )
+        if resolved:
+            self._safe_delete(message)
+            return True
+        if not added:
+            self._safe_delete(message)
+
+        if vote_count < self._popular_threshold():
+            return True
+
+        member_status = self._moderation_member_status(target_user_id)
+        if member_status == "unknown":
+            return True
+
+        report_message_ids = self.storage.popular_vote_message_ids(target_key)
+        if not self.storage.claim_popular_case(target_key, target_user_id):
+            self._safe_delete_ids(report_message_ids)
+            return True
+
+        if member_status == "admin":
+            self._safe_delete_ids(report_message_ids)
+            self.storage.clear_popular_votes(target_key)
+            return True
+
+        try:
+            self.api.ban_chat_member(self.config.target_chat_id, target_user_id)
+        except TelegramAPIError:
+            self.storage.release_popular_case(target_key)
+            LOGGER.exception("Échec du bannissement par justice populaire pour %s", target_user_id)
+            return True
+
+        self._safe_delete_ids(self._target_message_ids(target))
+        self._safe_delete_ids(report_message_ids)
+        self.storage.clear_popular_votes(target_key)
+        self.api.send_message(
+            self.config.target_chat_id,
+            "Merci à tous d’avoir lutté et d’avoir signalé. "
+            "Le contenu a été supprimé et son auteur a été banni.",
+        )
+        LOGGER.info(
+            "Justice populaire appliquée à %s après %s votes distincts",
+            target_user_id,
+            vote_count,
+        )
+        return True
+
+    def _popular_target_key(self, target: dict[str, Any]) -> str:
+        media_group_id = str(target.get("media_group_id") or "")
+        if media_group_id:
+            return f"media:{self.config.target_chat_id}:{media_group_id}"
+        return f"message:{self.config.target_chat_id}:{int(target['message_id'])}"
+
+    def _target_message_ids(self, target: dict[str, Any]) -> list[int]:
+        target_id = int(target["message_id"])
+        media_group_id = str(target.get("media_group_id") or "")
+        if not media_group_id:
+            return [target_id]
+        stored_ids = self.storage.list_media_group_message_ids(media_group_id)
+        return sorted(set(stored_ids) | {target_id})
+
+    def _popular_threshold(self) -> int:
+        try:
+            threshold = int(self.storage.get("popular_threshold", "5"))
+        except ValueError:
+            return 5
+        return min(POPULAR_THRESHOLD_MAX, max(POPULAR_THRESHOLD_MIN, threshold))
 
     def _is_privileged(self, message: dict[str, Any], user_id: int | None) -> bool:
         if user_id in self.config.admin_ids:
@@ -323,6 +561,18 @@ class GroupManagerService:
             if exc.error_code != 400:
                 LOGGER.warning("Impossible de supprimer le message %s : %s", message.get("message_id"), exc)
 
+    def _safe_delete_ids(self, message_ids: list[int]) -> None:
+        unique_ids = sorted(set(message_ids))
+        for index in range(0, len(unique_ids), 100):
+            chunk = unique_ids[index : index + 100]
+            if not chunk:
+                continue
+            try:
+                self.api.delete_messages(self.config.target_chat_id, chunk)
+            except TelegramAPIError as exc:
+                if exc.error_code != 400:
+                    LOGGER.warning("Impossible de supprimer les messages %s : %s", chunk, exc)
+
     def _handle_callback(self, query: dict[str, Any]) -> None:
         query_id = str(query["id"])
         user_id = int((query.get("from") or {}).get("id", 0))
@@ -355,6 +605,23 @@ class GroupManagerService:
         elif data == "toggle:forwards":
             self.storage.toggle("forwards_forbidden")
             self._show_panel(chat_id, message_id)
+        elif data == "toggle:justice":
+            enabled = self.storage.toggle("popular_justice")
+            if not enabled:
+                report_ids = self.storage.all_popular_vote_message_ids()
+                self._safe_delete_ids(report_ids)
+                self.storage.clear_all_popular_votes()
+            self._show_panel(chat_id, message_id)
+        elif data == "justice:threshold":
+            self._pending_inputs[user_id] = PendingInput("set_popular_threshold", chat_id, message_id)
+            self._edit_message(
+                chat_id,
+                message_id,
+                f"Envoyez le nouveau seuil entre {POPULAR_THRESHOLD_MIN} et {POPULAR_THRESHOLD_MAX}.\n"
+                "Seuls les votes de comptes distincts sont comptés.\n\n"
+                "Utilisez /cancel pour annuler.",
+                cancel_keyboard(),
+            )
         elif data == "words:menu":
             self._edit_message(chat_id, message_id, "Gestion des mots interdits", words_keyboard())
         elif data == "words:view":
@@ -422,6 +689,20 @@ class GroupManagerService:
                 return
             self.storage.set("rules_text", text)
             result = "Règles enregistrées. Elles seront publiées trois fois par séance."
+        elif pending.action == "set_popular_threshold":
+            try:
+                threshold = int(text)
+            except ValueError:
+                self.api.send_message(pending.panel_chat_id, "Le seuil doit être un nombre entier.")
+                return
+            if not POPULAR_THRESHOLD_MIN <= threshold <= POPULAR_THRESHOLD_MAX:
+                self.api.send_message(
+                    pending.panel_chat_id,
+                    f"Le seuil doit être compris entre {POPULAR_THRESHOLD_MIN} et {POPULAR_THRESHOLD_MAX}.",
+                )
+                return
+            self.storage.set("popular_threshold", str(threshold))
+            result = f"Seuil de justice populaire enregistré : {threshold} votes distincts."
         else:
             result = "Action inconnue."
         self._pending_inputs.pop(user_id, None)
@@ -434,11 +715,15 @@ class GroupManagerService:
         auto_open = self.storage.get_bool("auto_open")
         links_forbidden = self.storage.get_bool("links_forbidden")
         forwards_forbidden = self.storage.get_bool("forwards_forbidden")
+        popular_justice = self.storage.get_bool("popular_justice")
+        popular_threshold = self._popular_threshold()
         text = panel_text(
             is_open=is_effectively_open(auto_open, schedule, now),
             auto_open=auto_open,
             links_forbidden=links_forbidden,
             forwards_forbidden=forwards_forbidden,
+            popular_justice=popular_justice,
+            popular_threshold=popular_threshold,
             schedule=schedule,
             timezone_name=self.config.timezone_name,
         )
@@ -446,6 +731,8 @@ class GroupManagerService:
             auto_open=auto_open,
             links_forbidden=links_forbidden,
             forwards_forbidden=forwards_forbidden,
+            popular_justice=popular_justice,
+            popular_threshold=popular_threshold,
         )
         if message_id:
             self._edit_message(chat_id, message_id, text, keyboard)
@@ -592,7 +879,7 @@ class GroupManagerService:
         self._last_permission_sync = time_module.monotonic()
         LOGGER.info("Permissions du groupe resynchronisées : %s", "ouvert" if is_open_now else "fermé")
 
-    def _refresh_group_admins(self, *, strict: bool) -> None:
+    def _refresh_group_admins(self, *, strict: bool) -> list[dict[str, Any]]:
         try:
             admins = self.api.get_chat_administrators(self.config.target_chat_id)
             ids = {
@@ -603,10 +890,12 @@ class GroupManagerService:
             with self._admin_lock:
                 self._group_admin_ids = ids | set(self.config.admin_ids)
             self._last_admin_refresh = time_module.monotonic()
+            return admins
         except TelegramAPIError:
             if strict:
                 raise
             LOGGER.exception("Impossible d’actualiser la liste des administrateurs")
+            return []
 
     def _no_opening_message(self) -> str:
         if self._invite_link_cache:
