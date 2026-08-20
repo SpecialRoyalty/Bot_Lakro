@@ -1,6 +1,6 @@
 # Bot Telegram de gestion de groupe
 
-Bot autonome, prêt à être déployé sur Railway. Il fonctionne sans bibliothèque Python externe et utilise directement l’API officielle Telegram.
+Bot autonome, prêt à être déployé sur Railway. Il utilise directement l’API officielle Telegram et conserve sa configuration dans PostgreSQL.
 
 ## Fonctionnement inclus
 
@@ -19,7 +19,7 @@ Bot autonome, prêt à être déployé sur Railway. Il fonctionne sans biblioth�
 - Mots interdits configurables : 1 jour de restriction, 3 jours en cas de récidive, puis bannissement.
 - Règles configurables, publiées trois fois pendant chaque séance. Avec l’horaire 23 h–2 h, elles sont publiées vers 23 h, 0 h et 1 h.
 - Horaires disponibles dans le panneau : 22 h–0 h, 23 h–1 h, 23 h–2 h et 0 h–3 h.
-- Données persistantes dans SQLite : options, horaires, règles, mots interdits, récidives et rappels déjà envoyés.
+- Données persistantes dans PostgreSQL : options, horaires, règles, mots interdits, récidives et rappels déjà envoyés.
 - Point de contrôle Railway : `GET /health`.
 
 ## 1. Créer et préparer le bot Telegram
@@ -55,7 +55,8 @@ Utilisez les identifiants numériques personnels Telegram et placez-les dans `AD
 
 1. Placez ce dossier dans un dépôt GitHub privé.
 2. Dans [Railway](https://railway.com/), créez un projet avec **Deploy from GitHub repo** et sélectionnez le dépôt.
-3. Ajoutez les variables suivantes dans l’onglet **Variables** :
+3. Ajoutez un service **PostgreSQL** au même projet Railway.
+4. Ajoutez les variables suivantes dans l’onglet **Variables** du service du bot :
 
 | Variable | Exemple | Obligatoire |
 | --- | --- | --- |
@@ -63,15 +64,17 @@ Utilisez les identifiants numériques personnels Telegram et placez-les dans `AD
 | `TARGET_CHAT_ID` | `-1001234567890` | Oui |
 | `ADMIN_IDS` | `123456789,987654321` | Oui |
 | `GROUP_INVITE_LINK` | `https://t.me/+...` | Recommandé |
+| `DATABASE_URL` | `${{Postgres.DATABASE_URL}}` | Oui sur Railway |
 | `TZ` | `Europe/Paris` | Non, valeur par défaut |
-| `DATABASE_PATH` | `/data/bot.sqlite3` | Non, valeur par défaut |
 | `LOG_LEVEL` | `INFO` | Non |
 
-4. Dans le service Railway, ajoutez un **Volume** monté sur `/data`. Sans volume, les réglages et les récidives peuvent être perdus lors d’un redéploiement.
-5. Gardez une seule réplique du service : un bot utilisant `getUpdates` ne doit pas avoir plusieurs processus de long polling actifs avec le même jeton.
-6. Déployez. Le fichier `railway.json` sélectionne automatiquement le `Dockerfile`, démarre `python main.py` et utilise `/health` pour vérifier le service.
+La valeur doit être une **référence Railway**, exactement `DATABASE_URL=${{Postgres.DATABASE_URL}}`, sans recopier manuellement le mot de passe de la base. Le bot tolère également la valeur entourée de guillemets, comme `DATABASE_URL="${{Postgres.DATABASE_URL}}"`.
 
-Railway documente les volumes persistants ici : [Railway Volumes](https://docs.railway.com/volumes/reference).
+5. Aucun volume `/data` n’est nécessaire pour le bot lorsque PostgreSQL est configuré. Railway conserve les données dans le service PostgreSQL.
+6. Gardez une seule réplique du service : un bot utilisant `getUpdates` ne doit pas avoir plusieurs processus de long polling actifs avec le même jeton.
+7. Déployez. Le fichier `railway.json` sélectionne automatiquement le `Dockerfile`, installe Psycopg, démarre `python main.py` et utilise `/health` pour vérifier le service.
+
+Railway documente cette connexion ici : [PostgreSQL sur Railway](https://docs.railway.com/databases/postgresql).
 
 ## 4. Utiliser le panneau
 
@@ -118,7 +121,7 @@ python -m unittest discover -v
 
 La suite teste notamment les **1 024 combinaisons** des règles de modération, les quatre créneaux horaires, le passage à minuit, le bouton `OFF` pendant une séance, les échecs temporaires de Telegram et la suppression des messages d’entrée/sortie.
 
-Le projet est volontairement sans dépendance externe : Python 3.12 suffit.
+En local, si `DATABASE_URL` est absent, le bot utilise SQLite avec `DATABASE_PATH`. Sur Railway, PostgreSQL est automatiquement prioritaire dès que `DATABASE_URL` est présent.
 
 ## Référence Telegram
 

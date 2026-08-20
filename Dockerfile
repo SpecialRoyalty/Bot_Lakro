@@ -11,6 +11,7 @@ COPY . /app
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates tzdata \
     && rm -rf /var/lib/apt/lists/* \
+    && pip install --no-cache-dir -r requirements.txt \
     && mkdir -p /data
 
 EXPOSE 8080

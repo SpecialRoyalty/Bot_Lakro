@@ -1,2 +1,1 @@
-# Aucune dépendance externe : le bot utilise uniquement Python 3.12.
-
+psycopg[binary,pool]>=3.2,<4
