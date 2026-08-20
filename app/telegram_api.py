@@ -55,7 +55,13 @@ class TelegramAPI:
     def get_updates(self, offset: int | None, *, timeout: int = 45) -> list[dict[str, Any]]:
         payload: dict[str, Any] = {
             "timeout": timeout,
-            "allowed_updates": ["message", "edited_message", "callback_query"],
+            "allowed_updates": [
+                "message",
+                "edited_message",
+                "callback_query",
+                "chat_join_request",
+                "chat_member",
+            ],
         }
         if offset is not None:
             payload["offset"] = offset
@@ -77,6 +83,21 @@ class TelegramAPI:
         if reply_markup:
             payload["reply_markup"] = reply_markup
         return dict(self.call("sendMessage", payload))
+
+    def send_photo(
+        self,
+        chat_id: int,
+        photo: str,
+        *,
+        caption: str = "",
+        reply_markup: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {"chat_id": chat_id, "photo": photo}
+        if caption:
+            payload["caption"] = caption[:1024]
+        if reply_markup:
+            payload["reply_markup"] = reply_markup
+        return dict(self.call("sendPhoto", payload))
 
     def edit_message_text(
         self,
@@ -118,6 +139,24 @@ class TelegramAPI:
 
     def get_chat_member(self, chat_id: int, user_id: int) -> dict[str, Any]:
         return dict(self.call("getChatMember", {"chat_id": chat_id, "user_id": user_id}))
+
+    def create_chat_invite_link(
+        self,
+        chat_id: int,
+        *,
+        name: str,
+        creates_join_request: bool = True,
+    ) -> dict[str, Any]:
+        return dict(
+            self.call(
+                "createChatInviteLink",
+                {
+                    "chat_id": chat_id,
+                    "name": name[:32],
+                    "creates_join_request": creates_join_request,
+                },
+            )
+        )
 
     def set_chat_permissions(self, chat_id: int, permissions: dict[str, bool]) -> bool:
         return bool(

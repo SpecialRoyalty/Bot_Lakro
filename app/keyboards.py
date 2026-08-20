@@ -58,6 +58,7 @@ def panel_keyboard(
                 _button(f"Seuil : {popular_threshold}", "justice:threshold"),
             ],
             [_button("🚫 Mots interdits", "words:menu"), _button("📜 Règles", "rules:menu")],
+            [_button("📣 Pub invitation", "invite_ad:menu")],
             [_button("🕒 Horaires", "schedule:menu"), _button("🔄 Resynchroniser", "sync")],
             [_button("Actualiser", "panel")],
         ]
@@ -92,6 +93,30 @@ def schedule_keyboard() -> dict[str, Any]:
             [_button("23 h → 02 h", "schedule:2300-0200")],
             [_button("00 h → 03 h", "schedule:0000-0300")],
             [_button("⬅️ Retour", "panel")],
+        ]
+    }
+
+
+def invitation_ad_keyboard() -> dict[str, Any]:
+    return {
+        "inline_keyboard": [
+            [_button("Modifier le texte", "invite_ad:text"), _button("Modifier la photo", "invite_ad:photo")],
+            [_button("Lien de récompense", "invite_ad:reward")],
+            [_button("Aperçu", "invite_ad:preview"), _button("Publier", "invite_ad:publish")],
+            [_button("⬅️ Retour", "panel")],
+        ]
+    }
+
+
+def invitation_publication_keyboard(bot_username: str) -> dict[str, Any]:
+    return {
+        "inline_keyboard": [
+            [
+                {
+                    "text": "J'invite",
+                    "url": f"https://t.me/{bot_username.lstrip('@')}?start=invite",
+                }
+            ]
         ]
     }
 

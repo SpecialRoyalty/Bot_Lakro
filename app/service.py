@@ -22,6 +22,8 @@ from app.domain import (
 from app.health import HealthServer
 from app.keyboards import (
     cancel_keyboard,
+    invitation_ad_keyboard,
+    invitation_publication_keyboard,
     panel_keyboard,
     panel_text,
     rules_keyboard,
@@ -54,6 +56,10 @@ SCHEDULE_PRESETS = {
 TRUSTED_COMMANDS = {"/supprime", "/pasfr", "/ban"}
 POPULAR_THRESHOLD_MIN = 2
 POPULAR_THRESHOLD_MAX = 50
+REFERRAL_REQUIRED_COUNT = 10
+REFERRAL_STAY_SECONDS = 600
+REFERRAL_CHECK_INTERVAL = 30
+INVITATION_AD_TEXT_MAX = 1000
 
 
 class StartupError(RuntimeError):
@@ -83,6 +89,7 @@ class GroupManagerService:
         self._last_permission_sync = 0.0
         self._last_admin_refresh = 0.0
         self._last_prune = 0.0
+        self._last_referral_check = 0.0
         self._last_update_at: datetime | None = None
         self._last_scheduler_at: datetime | None = None
         self._started_at = datetime.now(timezone.utc)
@@ -177,6 +184,7 @@ class GroupManagerService:
                 for field, label in (
                     ("can_delete_messages", "supprimer les messages"),
                     ("can_restrict_members", "bannir et restreindre les membres"),
+                    ("can_invite_users", "créer des liens et recevoir les demandes d’adhésion"),
                 )
                 if not entry.get(field)
             ]
@@ -203,6 +211,16 @@ class GroupManagerService:
                 backoff = min(backoff * 2, 30)
 
     def _handle_update(self, update: dict[str, Any]) -> None:
+        join_request = update.get("chat_join_request")
+        if join_request:
+            self._handle_chat_join_request(join_request)
+            return
+
+        chat_member = update.get("chat_member")
+        if chat_member:
+            self._handle_chat_member_update(chat_member)
+            return
+
         callback_query = update.get("callback_query")
         if callback_query:
             self._handle_callback(callback_query)
@@ -224,7 +242,14 @@ class GroupManagerService:
             return
         text = extract_text(message).strip()
         chat_id = int(message["chat"]["id"])
-        command = text.split(maxsplit=1)[0].split("@", maxsplit=1)[0].lower() if text.startswith("/") else ""
+        parts = text.split(maxsplit=1)
+        command = parts[0].split("@", maxsplit=1)[0].lower() if text.startswith("/") else ""
+        payload = parts[1].strip().lower() if len(parts) == 2 else ""
+
+        if command == "/start" and payload == "invite":
+            self._pending_inputs.pop(user_id, None)
+            self._send_personal_referral_link(user_id, chat_id)
+            return
 
         if user_id not in self.config.admin_ids:
             if command == "/start":
@@ -244,10 +269,91 @@ class GroupManagerService:
 
         pending = self._pending_inputs.get(user_id)
         if pending:
-            self._consume_pending_input(user_id, text, pending)
+            self._consume_pending_input(user_id, message, pending)
+
+    def _send_personal_referral_link(self, user_id: int, chat_id: int) -> None:
+        profile = self.storage.get_referral_profile(user_id)
+        if profile:
+            invite_link, confirmed_count, _ = profile
+        else:
+            try:
+                result = self.api.create_chat_invite_link(
+                    self.config.target_chat_id,
+                    name=f"parrain-{user_id}",
+                    creates_join_request=True,
+                )
+            except TelegramAPIError:
+                LOGGER.exception("Impossible de créer le lien personnel de %s", user_id)
+                self.api.send_message(
+                    chat_id,
+                    "Impossible de créer votre lien pour le moment. Réessayez un peu plus tard.",
+                )
+                return
+            invite_link = str(result.get("invite_link") or "")
+            if not invite_link:
+                self.api.send_message(chat_id, "Telegram n’a pas retourné de lien d’invitation.")
+                return
+            self.storage.save_referral_link(user_id, invite_link)
+            confirmed_count = 0
+
+        self.api.send_message(
+            chat_id,
+            "Voici votre lien personnel d’invitation :\n"
+            f"{invite_link}\n\n"
+            f"Invitations validées : {confirmed_count}/{REFERRAL_REQUIRED_COUNT}",
+        )
+
+    def _handle_chat_join_request(self, request: dict[str, Any]) -> None:
+        chat_id = int((request.get("chat") or {}).get("id", 0))
+        if chat_id != self.config.target_chat_id:
+            return
+        candidate_user_id = sender_user_id({"from": request.get("from") or {}})
+        invite_link = str((request.get("invite_link") or {}).get("invite_link") or "")
+        if candidate_user_id is None or not invite_link:
+            return
+        requested_at = datetime.fromtimestamp(
+            int(request.get("date") or datetime.now(timezone.utc).timestamp()),
+            timezone.utc,
+        )
+        self.storage.record_referral_request(candidate_user_id, invite_link, requested_at)
+
+    def _handle_chat_member_update(self, update: dict[str, Any]) -> None:
+        chat_id = int((update.get("chat") or {}).get("id", 0))
+        if chat_id != self.config.target_chat_id:
+            return
+        member = update.get("new_chat_member") or {}
+        user_id = sender_user_id({"from": member.get("user") or {}})
+        if user_id is None:
+            return
+        event_at = datetime.fromtimestamp(
+            int(update.get("date") or datetime.now(timezone.utc).timestamp()),
+            timezone.utc,
+        )
+        if self._chat_member_is_present(member):
+            self.storage.mark_referral_joined(user_id, event_at)
+            return
+
+        result = self.storage.confirm_referral(
+            user_id,
+            event_at - timedelta(seconds=REFERRAL_STAY_SECONDS),
+        )
+        if result:
+            self._notify_referral_confirmation(*result)
+        self.storage.cancel_referral_pending(user_id)
+
+    @staticmethod
+    def _chat_member_is_present(member: dict[str, Any]) -> bool:
+        status = str(member.get("status") or "")
+        if status in {"creator", "administrator", "member"}:
+            return True
+        return status == "restricted" and bool(member.get("is_member"))
 
     def _handle_group_message(self, message: dict[str, Any]) -> None:
         user_id = sender_user_id(message)
+        for new_member in message.get("new_chat_members") or []:
+            new_user_id = sender_user_id({"from": new_member})
+            if new_user_id is not None:
+                self.storage.mark_referral_joined(new_user_id, datetime.now(timezone.utc))
         media_group_id = str(message.get("media_group_id") or "")
         if media_group_id and user_id is not None:
             self.storage.record_media_group_message(
@@ -264,15 +370,19 @@ class GroupManagerService:
         now = datetime.now(self.config.timezone)
         schedule = self._schedule()
         is_open_now = is_effectively_open(self.storage.get_bool("auto_open"), schedule, now)
+        popular_justice_enabled = self.storage.get_bool("popular_justice")
+        popular_signal = message.get("text") is not None and is_popular_justice_signal(
+            extract_text(message)
+        )
         if (
             is_open_now
-            and self.storage.get_bool("popular_justice")
+            and popular_justice_enabled
             and self._handle_popular_justice_report(message, user_id)
         ):
             return
 
         matched_word = find_banned_word(extract_text(message), self.storage.list_words())
-        if user_id in self.config.trusted_ids:
+        if user_id in self.config.trusted_ids or (popular_signal and not popular_justice_enabled):
             matched_word = None
         membership_event = is_membership_event(message)
         action = decide_message_action(
@@ -328,6 +438,7 @@ class GroupManagerService:
     ) -> None:
         self._safe_delete(message)
         if operator_user_id not in self.config.admin_ids | self.config.trusted_ids:
+            self._sanction_unauthorized_command(message, operator_user_id, command)
             return
 
         target = message.get("reply_to_message") or {}
@@ -396,6 +507,37 @@ class GroupManagerService:
                 LOGGER.info("Sanction /pasfr de %s au niveau %s", target_user_id, level)
             except TelegramAPIError:
                 LOGGER.exception("Échec de la sanction /pasfr pour %s", target_user_id)
+
+    def _sanction_unauthorized_command(
+        self,
+        message: dict[str, Any],
+        user_id: int | None,
+        command: str,
+    ) -> None:
+        if user_id is None or self._is_privileged(message, user_id):
+            return
+        if self._moderation_member_status(user_id) != "regular":
+            return
+
+        level = self.storage.register_unauthorized_command_offense(user_id)
+        sender = message.get("from") or {}
+        display_name = str(sender.get("first_name") or user_id)
+        try:
+            if level == 1:
+                until = int((datetime.now(timezone.utc) + timedelta(days=1)).timestamp())
+                self.api.restrict_chat_member(self.config.target_chat_id, user_id, until)
+                notice = f"{display_name} est sanctionné pendant 1 jour pour utilisation non autorisée de {command}."
+            elif level == 2:
+                until = int((datetime.now(timezone.utc) + timedelta(days=3)).timestamp())
+                self.api.restrict_chat_member(self.config.target_chat_id, user_id, until)
+                notice = f"{display_name} est sanctionné pendant 3 jours pour récidive avec {command}."
+            else:
+                self.api.ban_chat_member(self.config.target_chat_id, user_id)
+                notice = f"{display_name} a été banni après plusieurs utilisations de commandes réservées."
+            self.api.send_message(self.config.target_chat_id, notice)
+            LOGGER.info("Commande non autorisée %s par %s, niveau %s", command, user_id, level)
+        except TelegramAPIError:
+            LOGGER.exception("Échec de la sanction pour commande non autorisée de %s", user_id)
 
     def _handle_popular_justice_report(
         self,
@@ -622,6 +764,59 @@ class GroupManagerService:
                 "Utilisez /cancel pour annuler.",
                 cancel_keyboard(),
             )
+        elif data == "invite_ad:menu":
+            self._pending_inputs.pop(user_id, None)
+            self._show_invitation_ad_menu(chat_id, message_id)
+        elif data == "invite_ad:text":
+            self._pending_inputs[user_id] = PendingInput("set_invitation_ad_text", chat_id, message_id)
+            self._edit_message(
+                chat_id,
+                message_id,
+                f"Envoyez le texte de la publicité (maximum : {INVITATION_AD_TEXT_MAX} caractères).\n\n"
+                "Utilisez /cancel pour annuler.",
+                cancel_keyboard(),
+            )
+        elif data == "invite_ad:photo":
+            self._pending_inputs[user_id] = PendingInput("set_invitation_ad_photo", chat_id, message_id)
+            self._edit_message(
+                chat_id,
+                message_id,
+                "Envoyez la nouvelle photo de la publicité.\n\nUtilisez /cancel pour annuler.",
+                cancel_keyboard(),
+            )
+        elif data == "invite_ad:reward":
+            self._pending_inputs[user_id] = PendingInput("set_referral_reward_link", chat_id, message_id)
+            self._edit_message(
+                chat_id,
+                message_id,
+                "Envoyez le lien Telegram du groupe de récompense.\n\nUtilisez /cancel pour annuler.",
+                cancel_keyboard(),
+            )
+        elif data == "invite_ad:preview":
+            error = self._invitation_ad_configuration_error(require_reward=False)
+            if error:
+                self.api.send_message(chat_id, error)
+            else:
+                self.api.send_photo(
+                    chat_id,
+                    self.storage.get("invitation_ad_photo_id"),
+                    caption=self.storage.get("invitation_ad_text"),
+                    reply_markup=invitation_publication_keyboard(self._bot_username),
+                )
+            self._show_invitation_ad_menu(chat_id, message_id)
+        elif data == "invite_ad:publish":
+            error = self._invitation_ad_configuration_error()
+            if error:
+                self.api.send_message(chat_id, error)
+            else:
+                self.api.send_photo(
+                    self.config.target_chat_id,
+                    self.storage.get("invitation_ad_photo_id"),
+                    caption=self.storage.get("invitation_ad_text"),
+                    reply_markup=invitation_publication_keyboard(self._bot_username),
+                )
+                self.api.send_message(chat_id, "La publicité d’invitation a été publiée dans le groupe.")
+            self._show_invitation_ad_menu(chat_id, message_id)
         elif data == "words:menu":
             self._edit_message(chat_id, message_id, "Gestion des mots interdits", words_keyboard())
         elif data == "words:view":
@@ -673,11 +868,24 @@ class GroupManagerService:
             self._pending_inputs.pop(user_id, None)
             self._show_panel(chat_id, message_id)
 
-    def _consume_pending_input(self, user_id: int, text: str, pending: PendingInput) -> None:
-        if not text:
+    def _consume_pending_input(
+        self,
+        user_id: int,
+        message: dict[str, Any],
+        pending: PendingInput,
+    ) -> None:
+        text = extract_text(message).strip()
+        if pending.action == "set_invitation_ad_photo":
+            photos = list(message.get("photo") or [])
+            if not photos or not photos[-1].get("file_id"):
+                self.api.send_message(pending.panel_chat_id, "Envoyez une photo, pas un fichier ni du texte.")
+                return
+            self.storage.set("invitation_ad_photo_id", str(photos[-1]["file_id"]))
+            result = "Photo de la publicité enregistrée."
+        elif not text:
             self.api.send_message(pending.panel_chat_id, "Le texte ne peut pas être vide.")
             return
-        if pending.action == "add_word":
+        elif pending.action == "add_word":
             added = self.storage.add_word(text)
             result = "Mot ajouté." if added else "Ce mot existe déjà."
         elif pending.action == "remove_word":
@@ -703,11 +911,59 @@ class GroupManagerService:
                 return
             self.storage.set("popular_threshold", str(threshold))
             result = f"Seuil de justice populaire enregistré : {threshold} votes distincts."
+        elif pending.action == "set_invitation_ad_text":
+            if len(text) > INVITATION_AD_TEXT_MAX:
+                self.api.send_message(
+                    pending.panel_chat_id,
+                    f"Le texte est trop long (maximum : {INVITATION_AD_TEXT_MAX} caractères).",
+                )
+                return
+            self.storage.set("invitation_ad_text", text)
+            result = "Texte de la publicité enregistré."
+        elif pending.action == "set_referral_reward_link":
+            if not text.startswith(("https://t.me/", "https://telegram.me/")) or any(char.isspace() for char in text):
+                self.api.send_message(
+                    pending.panel_chat_id,
+                    "Envoyez un lien Telegram valide commençant par https://t.me/.",
+                )
+                return
+            self.storage.set("referral_reward_link", text)
+            result = "Lien du groupe de récompense enregistré."
         else:
             result = "Action inconnue."
         self._pending_inputs.pop(user_id, None)
         self.api.send_message(pending.panel_chat_id, result)
-        self._show_panel(pending.panel_chat_id, pending.panel_message_id)
+        if pending.action.startswith("set_invitation_") or pending.action == "set_referral_reward_link":
+            self._show_invitation_ad_menu(pending.panel_chat_id, pending.panel_message_id)
+        else:
+            self._show_panel(pending.panel_chat_id, pending.panel_message_id)
+
+    def _show_invitation_ad_menu(self, chat_id: int, message_id: int) -> None:
+        ad_text = self.storage.get("invitation_ad_text").strip()
+        photo_id = self.storage.get("invitation_ad_photo_id").strip()
+        reward_link = self.storage.get("referral_reward_link").strip()
+        text = (
+            "Publicité d’invitation\n\n"
+            f"Texte : {'configuré' if ad_text else 'manquant'}\n"
+            f"Photo : {'configurée' if photo_id else 'manquante'}\n"
+            f"Lien de récompense : {'configuré' if reward_link else 'manquant'}\n\n"
+            "Une seule publicité est conservée : toute modification remplace la précédente."
+        )
+        self._edit_message(chat_id, message_id, text, invitation_ad_keyboard())
+
+    def _invitation_ad_configuration_error(self, *, require_reward: bool = True) -> str:
+        missing: list[str] = []
+        if not self.storage.get("invitation_ad_text").strip():
+            missing.append("le texte")
+        if not self.storage.get("invitation_ad_photo_id").strip():
+            missing.append("la photo")
+        if require_reward and not self.storage.get("referral_reward_link").strip():
+            missing.append("le lien de récompense")
+        if not self._bot_username:
+            missing.append("le nom d’utilisateur du bot")
+        if not missing:
+            return ""
+        return "Publication impossible : configurez " + ", ".join(missing) + "."
 
     def _show_panel(self, chat_id: int, message_id: int | None = None) -> None:
         now = datetime.now(self.config.timezone)
@@ -779,6 +1035,11 @@ class GroupManagerService:
                 self.storage.prune_events()
                 self._last_prune = time_module.monotonic()
 
+            if force or time_module.monotonic() - self._last_referral_check >= REFERRAL_CHECK_INTERVAL:
+                self._process_due_referrals()
+                self._process_referral_rewards()
+                self._last_referral_check = time_module.monotonic()
+
             if not auto_open:
                 self._clear_countdown()
                 return
@@ -796,6 +1057,47 @@ class GroupManagerService:
                 event_key = f"countdown:{next_open.isoformat()}:{slot}"
                 text = f"⏳ Ouverture du groupe dans {format_duration(next_open - now)}."
                 self._replace_countdown_event(event_key, text)
+
+    def _process_due_referrals(self) -> None:
+        cutoff = datetime.now(timezone.utc) - timedelta(seconds=REFERRAL_STAY_SECONDS)
+        for candidate_user_id, _ in self.storage.due_referrals(cutoff):
+            try:
+                member = self.api.get_chat_member(self.config.target_chat_id, candidate_user_id)
+            except TelegramAPIError:
+                LOGGER.exception("Impossible de vérifier l’adhésion de %s", candidate_user_id)
+                continue
+            if not self._chat_member_is_present(member):
+                self.storage.cancel_referral_pending(candidate_user_id)
+                continue
+            result = self.storage.confirm_referral(candidate_user_id, cutoff)
+            if result:
+                self._notify_referral_confirmation(*result)
+
+    def _notify_referral_confirmation(self, inviter_id: int, confirmed_count: int) -> None:
+        try:
+            self.api.send_message(
+                inviter_id,
+                "✅ Une nouvelle invitation a été validée.\n"
+                f"Votre compteur : {confirmed_count}/{REFERRAL_REQUIRED_COUNT}",
+            )
+        except TelegramAPIError:
+            LOGGER.exception("Impossible de notifier le parrain %s", inviter_id)
+
+    def _process_referral_rewards(self) -> None:
+        reward_link = self.storage.get("referral_reward_link").strip()
+        if not reward_link:
+            return
+        for inviter_id, _ in self.storage.due_referral_rewards(REFERRAL_REQUIRED_COUNT):
+            try:
+                self.api.send_message(
+                    inviter_id,
+                    "🎉 Objectif atteint ! Voici le lien de votre groupe de récompense :\n"
+                    f"{reward_link}",
+                )
+            except TelegramAPIError:
+                LOGGER.exception("Impossible d’envoyer la récompense au parrain %s", inviter_id)
+                continue
+            self.storage.mark_referral_rewarded(inviter_id)
 
     def _handle_open_session(self, now: datetime, schedule: DailySchedule) -> None:
         session_key = schedule.session_key(now)

@@ -16,6 +16,9 @@ DEFAULT_SETTINGS = {
     "open_time": "23:00",
     "close_time": "02:00",
     "rules_text": "",
+    "invitation_ad_text": "",
+    "invitation_ad_photo_id": "",
+    "referral_reward_link": "",
     "last_countdown_message_id": "",
 }
 
@@ -67,6 +70,12 @@ class SQLiteStorage:
                     last_offense_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS unauthorized_command_offenses (
+                    user_id INTEGER PRIMARY KEY,
+                    offense_count INTEGER NOT NULL,
+                    last_offense_at TEXT NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS media_group_messages (
                     media_group_id TEXT NOT NULL,
                     message_id INTEGER NOT NULL,
@@ -87,6 +96,27 @@ class SQLiteStorage:
                     target_key TEXT PRIMARY KEY,
                     target_user_id INTEGER NOT NULL,
                     resolved_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS referral_profiles (
+                    inviter_id INTEGER PRIMARY KEY,
+                    invite_link TEXT NOT NULL UNIQUE,
+                    confirmed_count INTEGER NOT NULL DEFAULT 0,
+                    rewarded_at TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS referral_pending (
+                    candidate_user_id INTEGER PRIMARY KEY,
+                    inviter_id INTEGER NOT NULL,
+                    invite_link TEXT NOT NULL,
+                    requested_at TEXT NOT NULL,
+                    joined_at TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS referral_conversions (
+                    candidate_user_id INTEGER PRIMARY KEY,
+                    inviter_id INTEGER NOT NULL,
+                    confirmed_at TEXT NOT NULL
                 );
                 """
             )
@@ -191,6 +221,23 @@ class SQLiteStorage:
             )
         return count
 
+    def register_unauthorized_command_offense(self, user_id: int) -> int:
+        now = datetime.now(timezone.utc).isoformat()
+        with self._lock, self._connection:
+            row = self._connection.execute(
+                "SELECT offense_count FROM unauthorized_command_offenses WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()
+            count = int(row["offense_count"]) + 1 if row else 1
+            self._connection.execute(
+                "INSERT INTO unauthorized_command_offenses"
+                "(user_id, offense_count, last_offense_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(user_id) DO UPDATE SET "
+                "offense_count = excluded.offense_count, last_offense_at = excluded.last_offense_at",
+                (user_id, count, now),
+            )
+        return count
+
     def record_media_group_message(self, media_group_id: str, message_id: int, author_user_id: int) -> None:
         with self._lock, self._connection:
             self._connection.execute(
@@ -275,6 +322,140 @@ class SQLiteStorage:
         with self._lock, self._connection:
             self._connection.execute("DELETE FROM popular_justice_votes")
 
+    def get_referral_profile(self, inviter_id: int) -> tuple[str, int, bool] | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT invite_link, confirmed_count, rewarded_at "
+                "FROM referral_profiles WHERE inviter_id = ?",
+                (inviter_id,),
+            ).fetchone()
+        if not row:
+            return None
+        return str(row["invite_link"]), int(row["confirmed_count"]), row["rewarded_at"] is not None
+
+    def save_referral_link(self, inviter_id: int, invite_link: str) -> None:
+        with self._lock, self._connection:
+            self._connection.execute(
+                "INSERT INTO referral_profiles(inviter_id, invite_link, confirmed_count) "
+                "VALUES (?, ?, 0) ON CONFLICT(inviter_id) DO UPDATE SET invite_link = excluded.invite_link",
+                (inviter_id, invite_link),
+            )
+
+    def record_referral_request(
+        self,
+        candidate_user_id: int,
+        invite_link: str,
+        requested_at: datetime,
+    ) -> bool:
+        with self._lock, self._connection:
+            profile = self._connection.execute(
+                "SELECT inviter_id FROM referral_profiles WHERE invite_link = ?",
+                (invite_link,),
+            ).fetchone()
+            if not profile:
+                return False
+            inviter_id = int(profile["inviter_id"])
+            if inviter_id == candidate_user_id:
+                return False
+            converted = self._connection.execute(
+                "SELECT 1 FROM referral_conversions WHERE candidate_user_id = ?",
+                (candidate_user_id,),
+            ).fetchone()
+            if converted:
+                return False
+            self._connection.execute(
+                "INSERT INTO referral_pending"
+                "(candidate_user_id, inviter_id, invite_link, requested_at, joined_at) "
+                "VALUES (?, ?, ?, ?, NULL) ON CONFLICT(candidate_user_id) DO UPDATE SET "
+                "inviter_id = excluded.inviter_id, invite_link = excluded.invite_link, "
+                "requested_at = excluded.requested_at, joined_at = NULL",
+                (candidate_user_id, inviter_id, invite_link, requested_at.astimezone(timezone.utc).isoformat()),
+            )
+        return True
+
+    def mark_referral_joined(self, candidate_user_id: int, joined_at: datetime) -> bool:
+        with self._lock, self._connection:
+            cursor = self._connection.execute(
+                "UPDATE referral_pending SET joined_at = COALESCE(joined_at, ?) "
+                "WHERE candidate_user_id = ?",
+                (joined_at.astimezone(timezone.utc).isoformat(), candidate_user_id),
+            )
+        return cursor.rowcount == 1
+
+    def cancel_referral_pending(self, candidate_user_id: int) -> None:
+        with self._lock, self._connection:
+            self._connection.execute(
+                "DELETE FROM referral_pending WHERE candidate_user_id = ?",
+                (candidate_user_id,),
+            )
+
+    def due_referrals(self, cutoff: datetime, limit: int = 50) -> list[tuple[int, int]]:
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT candidate_user_id, inviter_id FROM referral_pending "
+                "WHERE joined_at IS NOT NULL AND joined_at <= ? ORDER BY joined_at LIMIT ?",
+                (cutoff.astimezone(timezone.utc).isoformat(), limit),
+            ).fetchall()
+        return [(int(row["candidate_user_id"]), int(row["inviter_id"])) for row in rows]
+
+    def confirm_referral(
+        self,
+        candidate_user_id: int,
+        cutoff: datetime,
+    ) -> tuple[int, int] | None:
+        cutoff_value = cutoff.astimezone(timezone.utc).isoformat()
+        now = datetime.now(timezone.utc).isoformat()
+        with self._lock, self._connection:
+            pending = self._connection.execute(
+                "SELECT inviter_id FROM referral_pending WHERE candidate_user_id = ? "
+                "AND joined_at IS NOT NULL AND joined_at <= ?",
+                (candidate_user_id, cutoff_value),
+            ).fetchone()
+            if not pending:
+                return None
+            inviter_id = int(pending["inviter_id"])
+            inserted = self._connection.execute(
+                "INSERT OR IGNORE INTO referral_conversions(candidate_user_id, inviter_id, confirmed_at) "
+                "VALUES (?, ?, ?)",
+                (candidate_user_id, inviter_id, now),
+            )
+            self._connection.execute(
+                "DELETE FROM referral_pending WHERE candidate_user_id = ?",
+                (candidate_user_id,),
+            )
+            if inserted.rowcount != 1:
+                return None
+            self._connection.execute(
+                "UPDATE referral_profiles SET confirmed_count = confirmed_count + 1 WHERE inviter_id = ?",
+                (inviter_id,),
+            )
+            profile = self._connection.execute(
+                "SELECT confirmed_count FROM referral_profiles WHERE inviter_id = ?",
+                (inviter_id,),
+            ).fetchone()
+        if not profile:
+            raise RuntimeError("Profil de parrainage SQLite introuvable.")
+        return inviter_id, int(profile["confirmed_count"])
+
+    def due_referral_rewards(self, required_count: int, limit: int = 50) -> list[tuple[int, int]]:
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT inviter_id, confirmed_count FROM referral_profiles "
+                "WHERE confirmed_count >= ? AND rewarded_at IS NULL "
+                "ORDER BY confirmed_count DESC LIMIT ?",
+                (required_count, limit),
+            ).fetchall()
+        return [(int(row["inviter_id"]), int(row["confirmed_count"])) for row in rows]
+
+    def mark_referral_rewarded(self, inviter_id: int) -> bool:
+        with self._lock, self._connection:
+            cursor = self._connection.execute(
+                "UPDATE referral_profiles SET rewarded_at = ? "
+                "WHERE inviter_id = ? AND rewarded_at IS NULL",
+                (datetime.now(timezone.utc).isoformat(), inviter_id),
+            )
+        return cursor.rowcount == 1
+
     def claim_event(self, event_key: str) -> bool:
         with self._lock, self._connection:
             cursor = self._connection.execute(
@@ -293,6 +474,7 @@ class SQLiteStorage:
             self._connection.execute("DELETE FROM sent_events WHERE created_at < ?", (cutoff,))
             self._connection.execute("DELETE FROM media_group_messages WHERE created_at < ?", (cutoff,))
             self._connection.execute("DELETE FROM popular_justice_votes WHERE created_at < ?", (cutoff,))
+            self._connection.execute("DELETE FROM referral_pending WHERE requested_at < ?", (cutoff,))
             case_cutoff = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
             self._connection.execute(
                 "DELETE FROM popular_justice_cases WHERE resolved_at < ?",

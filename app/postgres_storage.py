@@ -89,6 +89,13 @@ class PostgresStorage:
             )
             """,
             """
+            CREATE TABLE IF NOT EXISTS unauthorized_command_offenses (
+                user_id BIGINT PRIMARY KEY,
+                offense_count INTEGER NOT NULL,
+                last_offense_at TIMESTAMPTZ NOT NULL
+            )
+            """,
+            """
             CREATE TABLE IF NOT EXISTS media_group_messages (
                 media_group_id TEXT NOT NULL,
                 message_id BIGINT NOT NULL,
@@ -111,6 +118,30 @@ class PostgresStorage:
                 target_key TEXT PRIMARY KEY,
                 target_user_id BIGINT NOT NULL,
                 resolved_at TIMESTAMPTZ NOT NULL
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS referral_profiles (
+                inviter_id BIGINT PRIMARY KEY,
+                invite_link TEXT NOT NULL UNIQUE,
+                confirmed_count INTEGER NOT NULL DEFAULT 0,
+                rewarded_at TIMESTAMPTZ
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS referral_pending (
+                candidate_user_id BIGINT PRIMARY KEY,
+                inviter_id BIGINT NOT NULL,
+                invite_link TEXT NOT NULL,
+                requested_at TIMESTAMPTZ NOT NULL,
+                joined_at TIMESTAMPTZ
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS referral_conversions (
+                candidate_user_id BIGINT PRIMARY KEY,
+                inviter_id BIGINT NOT NULL,
+                confirmed_at TIMESTAMPTZ NOT NULL
             )
             """,
         )
@@ -226,6 +257,23 @@ class PostgresStorage:
             raise RuntimeError("Impossible d’enregistrer la sanction trusted PostgreSQL.")
         return int(row[0])
 
+    def register_unauthorized_command_offense(self, user_id: int) -> int:
+        with self._transaction() as connection:
+            row = connection.execute(
+                """
+                INSERT INTO unauthorized_command_offenses(user_id, offense_count, last_offense_at)
+                VALUES (%s, 1, %s)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    offense_count = unauthorized_command_offenses.offense_count + 1,
+                    last_offense_at = EXCLUDED.last_offense_at
+                RETURNING offense_count
+                """,
+                (user_id, datetime.now(timezone.utc)),
+            ).fetchone()
+        if not row:
+            raise RuntimeError("Impossible d’enregistrer l’abus de commande PostgreSQL.")
+        return int(row[0])
+
     def record_media_group_message(self, media_group_id: str, message_id: int, author_user_id: int) -> None:
         with self._transaction() as connection:
             connection.execute(
@@ -311,6 +359,136 @@ class PostgresStorage:
         with self._transaction() as connection:
             connection.execute("DELETE FROM popular_justice_votes")
 
+    def get_referral_profile(self, inviter_id: int) -> tuple[str, int, bool] | None:
+        with self._transaction() as connection:
+            row = connection.execute(
+                "SELECT invite_link, confirmed_count, rewarded_at "
+                "FROM referral_profiles WHERE inviter_id = %s",
+                (inviter_id,),
+            ).fetchone()
+        if not row:
+            return None
+        return str(row[0]), int(row[1]), row[2] is not None
+
+    def save_referral_link(self, inviter_id: int, invite_link: str) -> None:
+        with self._transaction() as connection:
+            connection.execute(
+                "INSERT INTO referral_profiles(inviter_id, invite_link, confirmed_count) "
+                "VALUES (%s, %s, 0) ON CONFLICT(inviter_id) DO UPDATE SET invite_link = EXCLUDED.invite_link",
+                (inviter_id, invite_link),
+            )
+
+    def record_referral_request(
+        self,
+        candidate_user_id: int,
+        invite_link: str,
+        requested_at: datetime,
+    ) -> bool:
+        with self._transaction() as connection:
+            profile = connection.execute(
+                "SELECT inviter_id FROM referral_profiles WHERE invite_link = %s",
+                (invite_link,),
+            ).fetchone()
+            if not profile:
+                return False
+            inviter_id = int(profile[0])
+            if inviter_id == candidate_user_id:
+                return False
+            converted = connection.execute(
+                "SELECT 1 FROM referral_conversions WHERE candidate_user_id = %s",
+                (candidate_user_id,),
+            ).fetchone()
+            if converted:
+                return False
+            connection.execute(
+                "INSERT INTO referral_pending"
+                "(candidate_user_id, inviter_id, invite_link, requested_at, joined_at) "
+                "VALUES (%s, %s, %s, %s, NULL) ON CONFLICT(candidate_user_id) DO UPDATE SET "
+                "inviter_id = EXCLUDED.inviter_id, invite_link = EXCLUDED.invite_link, "
+                "requested_at = EXCLUDED.requested_at, joined_at = NULL",
+                (candidate_user_id, inviter_id, invite_link, requested_at.astimezone(timezone.utc)),
+            )
+        return True
+
+    def mark_referral_joined(self, candidate_user_id: int, joined_at: datetime) -> bool:
+        with self._transaction() as connection:
+            cursor = connection.execute(
+                "UPDATE referral_pending SET joined_at = COALESCE(joined_at, %s) "
+                "WHERE candidate_user_id = %s",
+                (joined_at.astimezone(timezone.utc), candidate_user_id),
+            )
+        return cursor.rowcount == 1
+
+    def cancel_referral_pending(self, candidate_user_id: int) -> None:
+        with self._transaction() as connection:
+            connection.execute(
+                "DELETE FROM referral_pending WHERE candidate_user_id = %s",
+                (candidate_user_id,),
+            )
+
+    def due_referrals(self, cutoff: datetime, limit: int = 50) -> list[tuple[int, int]]:
+        with self._transaction() as connection:
+            rows = connection.execute(
+                "SELECT candidate_user_id, inviter_id FROM referral_pending "
+                "WHERE joined_at IS NOT NULL AND joined_at <= %s ORDER BY joined_at LIMIT %s",
+                (cutoff.astimezone(timezone.utc), limit),
+            ).fetchall()
+        return [(int(row[0]), int(row[1])) for row in rows]
+
+    def confirm_referral(
+        self,
+        candidate_user_id: int,
+        cutoff: datetime,
+    ) -> tuple[int, int] | None:
+        now = datetime.now(timezone.utc)
+        with self._transaction() as connection:
+            pending = connection.execute(
+                "SELECT inviter_id FROM referral_pending WHERE candidate_user_id = %s "
+                "AND joined_at IS NOT NULL AND joined_at <= %s FOR UPDATE",
+                (candidate_user_id, cutoff.astimezone(timezone.utc)),
+            ).fetchone()
+            if not pending:
+                return None
+            inviter_id = int(pending[0])
+            inserted = connection.execute(
+                "INSERT INTO referral_conversions(candidate_user_id, inviter_id, confirmed_at) "
+                "VALUES (%s, %s, %s) ON CONFLICT(candidate_user_id) DO NOTHING",
+                (candidate_user_id, inviter_id, now),
+            )
+            connection.execute(
+                "DELETE FROM referral_pending WHERE candidate_user_id = %s",
+                (candidate_user_id,),
+            )
+            if inserted.rowcount != 1:
+                return None
+            profile = connection.execute(
+                "UPDATE referral_profiles SET confirmed_count = confirmed_count + 1 "
+                "WHERE inviter_id = %s RETURNING confirmed_count",
+                (inviter_id,),
+            ).fetchone()
+        if not profile:
+            raise RuntimeError("Profil de parrainage PostgreSQL introuvable.")
+        return inviter_id, int(profile[0])
+
+    def due_referral_rewards(self, required_count: int, limit: int = 50) -> list[tuple[int, int]]:
+        with self._transaction() as connection:
+            rows = connection.execute(
+                "SELECT inviter_id, confirmed_count FROM referral_profiles "
+                "WHERE confirmed_count >= %s AND rewarded_at IS NULL "
+                "ORDER BY confirmed_count DESC LIMIT %s",
+                (required_count, limit),
+            ).fetchall()
+        return [(int(row[0]), int(row[1])) for row in rows]
+
+    def mark_referral_rewarded(self, inviter_id: int) -> bool:
+        with self._transaction() as connection:
+            cursor = connection.execute(
+                "UPDATE referral_profiles SET rewarded_at = %s "
+                "WHERE inviter_id = %s AND rewarded_at IS NULL",
+                (datetime.now(timezone.utc), inviter_id),
+            )
+        return cursor.rowcount == 1
+
     def claim_event(self, event_key: str) -> bool:
         with self._transaction() as connection:
             cursor = connection.execute(
@@ -331,6 +509,7 @@ class PostgresStorage:
             connection.execute("DELETE FROM sent_events WHERE created_at < %s", (cutoff,))
             connection.execute("DELETE FROM media_group_messages WHERE created_at < %s", (cutoff,))
             connection.execute("DELETE FROM popular_justice_votes WHERE created_at < %s", (cutoff,))
+            connection.execute("DELETE FROM referral_pending WHERE requested_at < %s", (cutoff,))
             case_cutoff = datetime.now(timezone.utc) - timedelta(days=30)
             connection.execute(
                 "DELETE FROM popular_justice_cases WHERE resolved_at < %s",
