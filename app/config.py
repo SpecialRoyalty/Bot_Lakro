@@ -29,6 +29,7 @@ class Config:
     group_invite_link: str
     timezone: ZoneInfo
     timezone_name: str
+    database_url: str
     database_path: Path
     port: int
     log_level: str
@@ -58,6 +59,12 @@ class Config:
         except ValueError as exc:
             raise ConfigError("PORT doit être un nombre.") from exc
 
+        database_url = os.getenv("DATABASE_URL", "").strip()
+        if len(database_url) >= 2 and database_url[0] == database_url[-1] and database_url[0] in {'"', "'"}:
+            database_url = database_url[1:-1].strip()
+        if database_url and not database_url.startswith(("postgresql://", "postgres://")):
+            raise ConfigError("DATABASE_URL doit être une URL PostgreSQL fournie par Railway.")
+
         return cls(
             bot_token=token,
             target_chat_id=chat_id,
@@ -65,8 +72,8 @@ class Config:
             group_invite_link=os.getenv("GROUP_INVITE_LINK", "").strip(),
             timezone=timezone,
             timezone_name=timezone_name,
+            database_url=database_url,
             database_path=Path(os.getenv("DATABASE_PATH", "/data/bot.sqlite3")),
             port=port,
             log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
         )
-

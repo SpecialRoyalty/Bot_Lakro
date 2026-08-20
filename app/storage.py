@@ -22,7 +22,9 @@ def normalize_word(value: str) -> str:
     return " ".join(unicodedata.normalize("NFKC", value).casefold().strip().split())
 
 
-class Storage:
+class SQLiteStorage:
+    backend_name = "sqlite"
+
     def __init__(self, path: Path) -> None:
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -154,3 +156,24 @@ class Storage:
         cutoff = (datetime.now(timezone.utc) - timedelta(days=keep_days)).isoformat()
         with self._lock, self._connection:
             self._connection.execute("DELETE FROM sent_events WHERE created_at < ?", (cutoff,))
+
+
+class Storage:
+    """Use PostgreSQL when DATABASE_URL is configured, SQLite otherwise."""
+
+    def __init__(self, path: Path, *, database_url: str = "") -> None:
+        if database_url:
+            # Lazy import keeps local unit tests dependency-free while Railway's
+            # Docker build installs Psycopg for production.
+            from app.postgres_storage import PostgresStorage
+
+            self._backend = PostgresStorage(database_url)
+        else:
+            self._backend = SQLiteStorage(path)
+
+    @property
+    def backend_name(self) -> str:
+        return str(self._backend.backend_name)
+
+    def __getattr__(self, name: str):
+        return getattr(self._backend, name)

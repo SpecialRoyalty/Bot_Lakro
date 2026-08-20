@@ -62,7 +62,7 @@ class PendingInput:
 class GroupManagerService:
     def __init__(self, config: Config) -> None:
         self.config = config
-        self.storage = Storage(config.database_path)
+        self.storage = Storage(config.database_path, database_url=config.database_url)
         self.api = TelegramAPI(config.bot_token)
         self.health_server = HealthServer(config.port, self.health_payload)
         self.stop_event = threading.Event()
@@ -87,6 +87,7 @@ class GroupManagerService:
             "status": "ok",
             "bot": self._bot_username or "starting",
             "timezone": self.config.timezone_name,
+            "database": self.storage.backend_name,
             "started_at": self._started_at.isoformat(),
             "last_update_at": self._last_update_at.isoformat() if self._last_update_at else None,
             "last_scheduler_at": self._last_scheduler_at.isoformat() if self._last_scheduler_at else None,
