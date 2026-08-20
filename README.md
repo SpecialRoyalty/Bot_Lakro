@@ -15,6 +15,8 @@ Bot autonome, prêt à être déployé sur Railway. Il utilise directement l’A
 - Activation/désactivation de l’ouverture automatique, des liens interdits et des transferts interdits.
 - `TRUSTED_IDS` configurables : exemption limitée aux mots interdits et commandes de modération par réponse.
 - Justice populaire activable/désactivable avec seuil configurable, fixé à **5 comptes distincts** par défaut.
+- Publicité d’invitation unique (texte et photo), modifiable et publiable depuis le panneau.
+- Parrainage par lien personnel avec demandes d’adhésion, compteur persistant et récompense automatique à **10 invitations validées**.
 - Lien interdit : suppression et bannissement immédiat de l’auteur.
 - Message transféré interdit : suppression sans sanction.
 - Story partagée : suppression et bannissement immédiat.
@@ -32,7 +34,8 @@ Bot autonome, prêt à être déployé sur Railway. Il utilise directement l’A
 3. Ajoutez le bot au groupe, puis nommez-le administrateur.
 4. Accordez-lui au minimum les droits suivants :
    - supprimer les messages ;
-   - bannir et restreindre les membres.
+   - bannir et restreindre les membres ;
+   - inviter des utilisateurs et gérer les demandes d’adhésion.
 5. Utilisez un **supergroupe** : les restrictions temporaires individuelles nécessitent ce type de groupe.
 
 Les personnes déclarées dans `ADMIN_IDS` peuvent utiliser le panneau et sont exemptées de la modération. Pour qu’elles puissent aussi écrire pendant la fermeture, nommez-les administrateurs du groupe Telegram : les permissions par défaut d’un groupe fermé bloquent les membres ordinaires.
@@ -95,6 +98,7 @@ Railway documente cette connexion ici : [PostgreSQL sur Railway](https://docs.ra
    - `Justice ON/OFF` et `Seuil` ;
    - `Mots interdits` → Voir, Ajouter ou Supprimer ;
    - `Règles` → Voir/Modifier ou Publier maintenant ;
+   - `Pub invitation` → modifier le texte, la photo et le lien du groupe de récompense, prévisualiser puis publier ;
    - `Horaires` → choisir un créneau ;
    - `Resynchroniser` → réappliquer immédiatement les permissions et actualiser les administrateurs Telegram.
 
@@ -105,6 +109,22 @@ Quand l’ouverture automatique passe sur `OFF`, le groupe est fermé immédiate
 
 Tous les nouveaux messages, photos ou vidéos envoyés par des membres ordinaires après ce passage sur `OFF` sont supprimés. L’API Telegram ne permet pas à un bot de relire librement tout l’historique du groupe : cette suppression concerne donc les contenus reçus par le bot au moment de la fermeture ou après celle-ci, et non d’anciens médias déjà présents avant son démarrage.
 
+## Publicité d’invitation et récompense
+
+Le panneau conserve une seule publicité composée d’un texte et d’une photo. Toute modification remplace la version précédente. Le bouton `Publier` l’envoie dans le groupe avec le bouton **J’invite**.
+
+Lorsqu’un membre utilise ce bouton :
+
+1. Telegram ouvre la conversation privée avec le bot.
+2. Le bot crée ou réutilise son lien personnel d’invitation, configuré pour demander l’approbation des administrateurs.
+3. Lorsqu’une personne rejoint avec ce lien, est acceptée et satisfait à la validation interne, le compteur du parrain augmente une seule fois.
+4. Le parrain reçoit une notification privée indiquant son nouveau compteur.
+5. À **10 invitations validées**, le bot lui envoie une seule fois le lien du groupe de récompense configuré dans le panneau.
+
+Le délai et les contrôles de validation restent internes au bot et ne sont jamais indiqués dans ses messages publics ou privés. Un départ avant validation annule l’invitation en attente. Une même personne ne peut jamais être comptée deux fois, même après un redémarrage.
+
+Cette fonction exige que le bot conserve le droit administrateur d’inviter des utilisateurs. Le bot ne valide ni ne refuse lui-même les demandes : les administrateurs du groupe gardent la décision. Les liens personnels, demandes en attente, compteurs et récompenses déjà envoyées sont conservés dans PostgreSQL.
+
 ## Commandes trusted
 
 Les identifiants présents dans `TRUSTED_IDS` et `ADMIN_IDS` peuvent utiliser ces commandes dans le groupe. La commande doit être envoyée **en réponse** au message ou au média ciblé :
@@ -113,7 +133,7 @@ Les identifiants présents dans `TRUSTED_IDS` et `ADMIN_IDS` peuvent utiliser ce
 - `/pasfr` : empêche l’auteur d’écrire pendant 1 heure, puis 1 jour en cas de récidive, puis 5 jours, puis le bannit au quatrième signalement.
 - `/ban` : bannit immédiatement l’auteur. Telegram reçoit l’option `revoke_messages=true`, qui supprime tous ses messages du supergroupe.
 
-Les commandes sont supprimées après leur traitement. Une personne non autorisée ne peut pas les utiliser. Les commandes `/pasfr` et `/ban` refusent de sanctionner l’auteur de la commande, un bot ou un administrateur Telegram.
+La commande est toujours supprimée, qu’elle soit autorisée ou non. Une personne absente de `TRUSTED_IDS` et `ADMIN_IDS` qui tente d’utiliser `/supprime`, `/pasfr` ou `/ban` reçoit 1 jour de restriction, puis 3 jours en cas de récidive, puis un bannissement à la troisième tentative. Cette progression est indépendante des sanctions pour mots interdits. Les administrateurs Telegram ne peuvent pas être restreints ou bannis par ce mécanisme. Les commandes `/pasfr` et `/ban` refusent aussi de sanctionner l’auteur de la commande ou un bot.
 
 ## Justice populaire
 
@@ -126,6 +146,8 @@ Quand cette option est sur `ON`, un membre peut répondre à un message, une pho
 - Le bot publie ensuite : « Merci à tous d’avoir lutté et d’avoir signalé. Le contenu a été supprimé et son auteur a été banni. »
 - Les administrateurs Telegram sont protégés contre un bannissement collectif. Un `TRUSTED_ID` ordinaire ne l’est pas.
 - Le bouton `Seuil` du panneau accepte une valeur de 2 à 50. Passer la justice populaire sur `OFF` supprime et remet à zéro les votes encore en attente.
+
+Lorsque la justice populaire est sur `OFF`, écrire exactement l’un de ces mots-signalements ne crée aucun vote, ne supprime rien et ne déclenche pas non plus une sanction de mot interdit, même si `pedo` figure dans cette liste. Le message reste donc affiché pendant l’ouverture. Les règles générales restent prioritaires : un message envoyé pendant la fermeture est toujours supprimé.
 
 Les votes, les albums suivis et les récidives `/pasfr` sont enregistrés dans PostgreSQL afin de rester cohérents après un redémarrage.
 
@@ -162,10 +184,10 @@ Exécutez les tests :
 python -m unittest discover -v
 ```
 
-La suite contient **57 tests** et vérifie notamment les **1 024 combinaisons** des règles de modération, les quatre créneaux horaires, le passage à minuit, les trusted IDs, les quatre niveaux `/pasfr`, les votes distincts, les albums, les administrateurs protégés, le bouton `OFF` pendant une séance et les échecs temporaires de Telegram.
+La suite contient **68 tests** et vérifie notamment les **1 024 combinaisons** des règles de modération, les quatre créneaux horaires, le passage à minuit, les trusted IDs, les commandes non autorisées, les quatre niveaux `/pasfr`, les votes distincts, les albums, les administrateurs protégés, le bouton `OFF` pendant une séance, les échecs temporaires de Telegram ainsi que la publicité, les liens personnels, la validation des adhésions, les compteurs et l’envoi unique de la récompense.
 
 En local, si `DATABASE_URL` est absent, le bot utilise SQLite avec `DATABASE_PATH`. Sur Railway, PostgreSQL est automatiquement prioritaire dès que `DATABASE_URL` est présent.
 
 ## Référence Telegram
 
-Le verrouillage utilise `setChatPermissions`, les sanctions utilisent `restrictChatMember` et `banChatMember`, le nettoyage groupé utilise `deleteMessages`, et les albums utilisent `Message.media_group_id`. Selon l’[API officielle Telegram Bot](https://core.telegram.org/bots/api), `revoke_messages=true` supprime tous les messages de l’utilisateur banni et cette révocation est toujours active dans les supergroupes.
+Le verrouillage utilise `setChatPermissions`, les sanctions utilisent `restrictChatMember` et `banChatMember`, le nettoyage groupé utilise `deleteMessages`, et les albums utilisent `Message.media_group_id`. Le parrainage utilise `createChatInviteLink` avec demandes d’adhésion, les mises à jour `chat_join_request` et `chat_member`, ainsi que le [deep linking Telegram](https://core.telegram.org/bots/features#deep-linking). Selon l’[API officielle Telegram Bot](https://core.telegram.org/bots/api), `revoke_messages=true` supprime tous les messages de l’utilisateur banni et cette révocation est toujours active dans les supergroupes.
