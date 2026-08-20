@@ -7,12 +7,14 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-COPY . /app
+COPY requirements.txt /app/requirements.txt
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates tzdata \
     && rm -rf /var/lib/apt/lists/* \
-    && pip install --no-cache-dir -r requirements.txt \
-    && mkdir -p /data
+    && pip install --no-cache-dir -r requirements.txt
+
+COPY . /app
+RUN mkdir -p /data
 
 EXPOSE 8080
 

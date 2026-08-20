@@ -5,7 +5,7 @@ import signal
 import sys
 
 from app.config import Config, ConfigError
-from app.service import GroupManagerService
+from app.service import GroupManagerService, StartupError
 
 
 def configure_logging(level: str) -> None:
@@ -34,6 +34,9 @@ def main() -> int:
 
     try:
         service.run()
+    except StartupError as exc:
+        logging.getLogger(__name__).error("Démarrage impossible — %s", exc)
+        return 1
     except Exception:
         logging.getLogger(__name__).exception("Le bot s’est arrêté à cause d’une erreur fatale")
         return 1
@@ -42,4 +45,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

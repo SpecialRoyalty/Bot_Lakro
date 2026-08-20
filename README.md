@@ -13,13 +13,16 @@ Bot autonome, prêt à être déployé sur Railway. Il utilise directement l’A
 - Avertissements uniques à 30, 15 et 5 minutes de la fermeture.
 - Panneau administrateur entièrement composé de boutons, accessible avec `/panel` dans la conversation privée du bot.
 - Activation/désactivation de l’ouverture automatique, des liens interdits et des transferts interdits.
+- `TRUSTED_IDS` configurables : exemption limitée aux mots interdits et commandes de modération par réponse.
+- Justice populaire activable/désactivable avec seuil configurable, fixé à **5 comptes distincts** par défaut.
 - Lien interdit : suppression et bannissement immédiat de l’auteur.
 - Message transféré interdit : suppression sans sanction.
 - Story partagée : suppression et bannissement immédiat.
 - Mots interdits configurables : 1 jour de restriction, 3 jours en cas de récidive, puis bannissement.
 - Règles configurables, publiées trois fois pendant chaque séance. Avec l’horaire 23 h–2 h, elles sont publiées vers 23 h, 0 h et 1 h.
 - Horaires disponibles dans le panneau : 22 h–0 h, 23 h–1 h, 23 h–2 h et 0 h–3 h.
-- Données persistantes dans PostgreSQL : options, horaires, règles, mots interdits, récidives et rappels déjà envoyés.
+- Données persistantes dans PostgreSQL : options, horaires, règles, mots interdits, récidives, votes populaires et rappels déjà envoyés.
+- Runtime léger : une seule connexion PostgreSQL, paramètres de modération conservés en mémoire et aucune utilisation du GPU.
 - Point de contrôle Railway : `GET /health`.
 
 ## 1. Créer et préparer le bot Telegram
@@ -33,6 +36,8 @@ Bot autonome, prêt à être déployé sur Railway. Il utilise directement l’A
 5. Utilisez un **supergroupe** : les restrictions temporaires individuelles nécessitent ce type de groupe.
 
 Les personnes déclarées dans `ADMIN_IDS` peuvent utiliser le panneau et sont exemptées de la modération. Pour qu’elles puissent aussi écrire pendant la fermeture, nommez-les administrateurs du groupe Telegram : les permissions par défaut d’un groupe fermé bloquent les membres ordinaires.
+
+Les personnes déclarées dans `TRUSTED_IDS` ne sont exemptées **que des sanctions pour mots interdits**. Elles restent soumises à la fermeture, aux liens interdits, aux stories, aux transferts et à la justice populaire. Elles n’ont pas accès au panneau administrateur.
 
 ## 2. Trouver les identifiants
 
@@ -63,6 +68,7 @@ Utilisez les identifiants numériques personnels Telegram et placez-les dans `AD
 | `BOT_TOKEN` | `123456789:secret` | Oui |
 | `TARGET_CHAT_ID` | `-1001234567890` | Oui |
 | `ADMIN_IDS` | `123456789,987654321` | Oui |
+| `TRUSTED_IDS` | `111111111,222222222` | Non |
 | `GROUP_INVITE_LINK` | `https://t.me/+...` | Recommandé |
 | `DATABASE_URL` | `${{Postgres.DATABASE_URL}}` | Oui sur Railway |
 | `TZ` | `Europe/Paris` | Non, valeur par défaut |
@@ -74,6 +80,8 @@ La valeur doit être une **référence Railway**, exactement `DATABASE_URL=${{Po
 6. Gardez une seule réplique du service : un bot utilisant `getUpdates` ne doit pas avoir plusieurs processus de long polling actifs avec le même jeton.
 7. Déployez. Le fichier `railway.json` sélectionne automatiquement le `Dockerfile`, installe Psycopg, démarre `python main.py` et utilise `/health` pour vérifier le service.
 
+Le premier build télécharge l’image Python et installe les dépendances. Les déploiements suivants réutilisent la couche des dépendances tant que `requirements.txt` ne change pas. Un échec de démarrage n’attend plus cinq minutes : le healthcheck expire après 60 secondes et Railway limite les redémarrages automatiques à trois.
+
 Railway documente cette connexion ici : [PostgreSQL sur Railway](https://docs.railway.com/databases/postgresql).
 
 ## 4. Utiliser le panneau
@@ -84,6 +92,7 @@ Railway documente cette connexion ici : [PostgreSQL sur Railway](https://docs.ra
    - `Automatique ON/OFF` ;
    - `Liens ON/OFF` ;
    - `Forwards ON/OFF` ;
+   - `Justice ON/OFF` et `Seuil` ;
    - `Mots interdits` → Voir, Ajouter ou Supprimer ;
    - `Règles` → Voir/Modifier ou Publier maintenant ;
    - `Horaires` → choisir un créneau ;
@@ -96,6 +105,30 @@ Quand l’ouverture automatique passe sur `OFF`, le groupe est fermé immédiate
 
 Tous les nouveaux messages, photos ou vidéos envoyés par des membres ordinaires après ce passage sur `OFF` sont supprimés. L’API Telegram ne permet pas à un bot de relire librement tout l’historique du groupe : cette suppression concerne donc les contenus reçus par le bot au moment de la fermeture ou après celle-ci, et non d’anciens médias déjà présents avant son démarrage.
 
+## Commandes trusted
+
+Les identifiants présents dans `TRUSTED_IDS` et `ADMIN_IDS` peuvent utiliser ces commandes dans le groupe. La commande doit être envoyée **en réponse** au message ou au média ciblé :
+
+- `/supprime` : supprime le message ciblé. Si le message appartient à un album connu du bot, tout l’album est supprimé.
+- `/pasfr` : empêche l’auteur d’écrire pendant 1 heure, puis 1 jour en cas de récidive, puis 5 jours, puis le bannit au quatrième signalement.
+- `/ban` : bannit immédiatement l’auteur. Telegram reçoit l’option `revoke_messages=true`, qui supprime tous ses messages du supergroupe.
+
+Les commandes sont supprimées après leur traitement. Une personne non autorisée ne peut pas les utiliser. Les commandes `/pasfr` et `/ban` refusent de sanctionner l’auteur de la commande, un bot ou un administrateur Telegram.
+
+## Justice populaire
+
+Quand cette option est sur `ON`, un membre peut répondre à un message, une photo, une vidéo ou un élément d’album avec uniquement `Pédo`, `Pedo`, `pédo`, `pedo` ou `Pdo`. La casse, les accents et une ponctuation finale sont ignorés.
+
+- Un compte ne fournit qu’un vote par contenu ; ses doublons sont supprimés et ne font pas progresser le compteur.
+- L’auteur ne peut pas voter contre son propre contenu et les comptes automatisés ne comptent pas.
+- Tous les éléments d’un même album utilisent le même compteur.
+- À 5 votes distincts par défaut, l’auteur est banni avec révocation de tous ses messages. Le contenu ciblé et tous les commentaires de signalement enregistrés sont supprimés.
+- Le bot publie ensuite : « Merci à tous d’avoir lutté et d’avoir signalé. Le contenu a été supprimé et son auteur a été banni. »
+- Les administrateurs Telegram sont protégés contre un bannissement collectif. Un `TRUSTED_ID` ordinaire ne l’est pas.
+- Le bouton `Seuil` du panneau accepte une valeur de 2 à 50. Passer la justice populaire sur `OFF` supprime et remet à zéro les votes encore en attente.
+
+Les votes, les albums suivis et les récidives `/pasfr` sont enregistrés dans PostgreSQL afin de rester cohérents après un redémarrage.
+
 ## Sécurité et comportement en cas de panne
 
 - Le jeton n’est jamais écrit dans les logs. Conservez `BOT_TOKEN` uniquement dans les variables Railway.
@@ -104,6 +137,16 @@ Tous les nouveaux messages, photos ou vidéos envoyés par des membres ordinaire
 - Si Telegram ne répond pas pendant la vérification du statut d’un membre, le contenu interdit est supprimé par sécurité, mais aucun bannissement ni restriction irréversible n’est appliqué sans confirmation.
 - Si le processus redémarre pendant une séance, les rappels déjà enregistrés ne sont pas renvoyés en double.
 - Le bot vérifie une dernière fois qu’un utilisateur n’est pas administrateur Telegram avant toute sanction irréversible.
+
+## Dépannage : `Telegram getChat: 400 Bad Request: chat not found`
+
+Cette erreur n’est pas causée par la RAM ou le processeur. Telegram indique que le bot associé à `BOT_TOKEN` ne peut pas accéder au chat demandé. Vérifiez ces trois points :
+
+1. `TARGET_CHAT_ID` contient l’identifiant **numérique** du supergroupe, par exemple `-1001234567890`, et non son lien d’invitation `https://t.me/+...`.
+2. Le bot créé avec ce même `BOT_TOKEN` est déjà présent dans ce groupe et nommé administrateur.
+3. Le jeton n’appartient pas à un autre bot. Comparez le nom affiché par BotFather avec celui ajouté au groupe.
+
+Après correction, redéployez. Si le problème persiste, arrêtez temporairement le service Railway, envoyez un message dans le groupe puis utilisez la commande `getUpdates` de la section 2 pour recopier exactement `message.chat.id`. Le nouveau message de démarrage du programme indique directement ces contrôles, sans imprimer plusieurs pages de traceback.
 
 ## Développement local
 
@@ -119,10 +162,10 @@ Exécutez les tests :
 python -m unittest discover -v
 ```
 
-La suite teste notamment les **1 024 combinaisons** des règles de modération, les quatre créneaux horaires, le passage à minuit, le bouton `OFF` pendant une séance, les échecs temporaires de Telegram et la suppression des messages d’entrée/sortie.
+La suite contient **57 tests** et vérifie notamment les **1 024 combinaisons** des règles de modération, les quatre créneaux horaires, le passage à minuit, les trusted IDs, les quatre niveaux `/pasfr`, les votes distincts, les albums, les administrateurs protégés, le bouton `OFF` pendant une séance et les échecs temporaires de Telegram.
 
 En local, si `DATABASE_URL` est absent, le bot utilise SQLite avec `DATABASE_PATH`. Sur Railway, PostgreSQL est automatiquement prioritaire dès que `DATABASE_URL` est présent.
 
 ## Référence Telegram
 
-Le verrouillage utilise `setChatPermissions`, les sanctions utilisent `restrictChatMember` et `banChatMember`, et les stories partagées sont identifiées avec le champ `Message.story` de l’[API officielle Telegram Bot](https://core.telegram.org/bots/api).
+Le verrouillage utilise `setChatPermissions`, les sanctions utilisent `restrictChatMember` et `banChatMember`, le nettoyage groupé utilise `deleteMessages`, et les albums utilisent `Message.media_group_id`. Selon l’[API officielle Telegram Bot](https://core.telegram.org/bots/api), `revoke_messages=true` supprime tous les messages de l’utilisateur banni et cette révocation est toujours active dans les supergroupes.
