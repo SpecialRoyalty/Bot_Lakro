@@ -88,6 +88,7 @@ def rules_keyboard() -> dict[str, Any]:
 def schedule_keyboard() -> dict[str, Any]:
     return {
         "inline_keyboard": [
+            [_button("🧪 TEST : 10 h → 10 h 30", "schedule:1000-1030")],
             [_button("22 h → 00 h", "schedule:2200-0000")],
             [_button("23 h → 01 h", "schedule:2300-0100")],
             [_button("23 h → 02 h", "schedule:2300-0200")],

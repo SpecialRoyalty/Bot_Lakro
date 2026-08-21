@@ -48,6 +48,7 @@ from app.telegram_api import TelegramAPI, TelegramAPIError, closed_permissions, 
 
 LOGGER = logging.getLogger(__name__)
 SCHEDULE_PRESETS = {
+    "1000-1030": ("10:00", "10:30"),
     "2200-0000": ("22:00", "00:00"),
     "2300-0100": ("23:00", "01:00"),
     "2300-0200": ("23:00", "02:00"),
@@ -90,6 +91,8 @@ class GroupManagerService:
         self._last_admin_refresh = 0.0
         self._last_prune = 0.0
         self._last_referral_check = 0.0
+        self._last_effective_open: bool | None = None
+        self._session_cleanup_pending = False
         self._last_update_at: datetime | None = None
         self._last_scheduler_at: datetime | None = None
         self._started_at = datetime.now(timezone.utc)
@@ -350,6 +353,22 @@ class GroupManagerService:
 
     def _handle_group_message(self, message: dict[str, Any]) -> None:
         user_id = sender_user_id(message)
+        with self._scheduler_lock:
+            now = datetime.now(self.config.timezone)
+            schedule = self._schedule()
+            is_open_now = is_effectively_open(self.storage.get_bool("auto_open"), schedule, now)
+            session_key = schedule.session_key(now) if is_open_now else None
+            if session_key:
+                try:
+                    self.storage.record_session_message(session_key, int(message["message_id"]))
+                except Exception:
+                    LOGGER.exception(
+                        "Message %s impossible à enregistrer pour le nettoyage de séance",
+                        message.get("message_id"),
+                    )
+                    self._safe_delete(message)
+                    return
+
         for new_member in message.get("new_chat_members") or []:
             new_user_id = sender_user_id({"from": new_member})
             if new_user_id is not None:
@@ -367,9 +386,6 @@ class GroupManagerService:
             self._handle_trusted_command(message, command, user_id)
             return
 
-        now = datetime.now(self.config.timezone)
-        schedule = self._schedule()
-        is_open_now = is_effectively_open(self.storage.get_bool("auto_open"), schedule, now)
         popular_justice_enabled = self.storage.get_bool("popular_justice")
         popular_signal = message.get("text") is not None and is_popular_justice_signal(
             extract_text(message)
@@ -468,10 +484,7 @@ class GroupManagerService:
             try:
                 self.api.ban_chat_member(self.config.target_chat_id, target_user_id)
                 self._safe_delete_ids(self._target_message_ids(target))
-                self.api.send_message(
-                    self.config.target_chat_id,
-                    f"{display_name} a été banni par la modération.",
-                )
+                self._send_group_message(f"{display_name} a été banni par la modération.")
                 LOGGER.info("Bannissement par commande de %s par %s", target_user_id, operator_user_id)
             except TelegramAPIError:
                 LOGGER.exception("Échec du bannissement par commande pour %s", target_user_id)
@@ -491,19 +504,13 @@ class GroupManagerService:
                     label = "5 jours"
                 else:
                     self.api.ban_chat_member(self.config.target_chat_id, target_user_id)
-                    self.api.send_message(
-                        self.config.target_chat_id,
-                        f"{display_name} a été banni après plusieurs sanctions.",
-                    )
+                    self._send_group_message(f"{display_name} a été banni après plusieurs sanctions.")
                     LOGGER.info("Bannissement /pasfr de %s au niveau %s", target_user_id, level)
                     return
 
                 until = int((datetime.now(timezone.utc) + duration).timestamp())
                 self.api.restrict_chat_member(self.config.target_chat_id, target_user_id, until)
-                self.api.send_message(
-                    self.config.target_chat_id,
-                    f"{display_name} ne peut plus écrire pendant {label}.",
-                )
+                self._send_group_message(f"{display_name} ne peut plus écrire pendant {label}.")
                 LOGGER.info("Sanction /pasfr de %s au niveau %s", target_user_id, level)
             except TelegramAPIError:
                 LOGGER.exception("Échec de la sanction /pasfr pour %s", target_user_id)
@@ -534,7 +541,7 @@ class GroupManagerService:
             else:
                 self.api.ban_chat_member(self.config.target_chat_id, user_id)
                 notice = f"{display_name} a été banni après plusieurs utilisations de commandes réservées."
-            self.api.send_message(self.config.target_chat_id, notice)
+            self._send_group_message(notice)
             LOGGER.info("Commande non autorisée %s par %s, niveau %s", command, user_id, level)
         except TelegramAPIError:
             LOGGER.exception("Échec de la sanction pour commande non autorisée de %s", user_id)
@@ -604,8 +611,7 @@ class GroupManagerService:
         self._safe_delete_ids(self._target_message_ids(target))
         self._safe_delete_ids(report_message_ids)
         self.storage.clear_popular_votes(target_key)
-        self.api.send_message(
-            self.config.target_chat_id,
+        self._send_group_message(
             "Merci à tous d’avoir lutté et d’avoir signalé. "
             "Le contenu a été supprimé et son auteur a été banni.",
         )
@@ -691,7 +697,7 @@ class GroupManagerService:
             else:
                 self.api.ban_chat_member(self.config.target_chat_id, user_id)
                 notice = f"{display_name} a été banni après plusieurs récidives."
-            self.api.send_message(self.config.target_chat_id, notice)
+            self._send_group_message(notice)
             LOGGER.info("Sanction mot interdit pour %s (niveau %s, mot %r)", user_id, count, word)
         except TelegramAPIError:
             LOGGER.exception("Impossible d’appliquer la sanction au membre %s", user_id)
@@ -715,6 +721,116 @@ class GroupManagerService:
                 if exc.error_code != 400:
                     LOGGER.warning("Impossible de supprimer les messages %s : %s", chunk, exc)
 
+    def _current_session_key(self) -> str | None:
+        now = datetime.now(self.config.timezone)
+        schedule = self._schedule()
+        if not is_effectively_open(self.storage.get_bool("auto_open"), schedule, now):
+            return None
+        return schedule.session_key(now)
+
+    def _remember_sent_group_message(self, session_key: str | None, message_id: int) -> None:
+        if not session_key:
+            return
+        try:
+            self.storage.record_session_message(session_key, message_id)
+        except Exception:
+            LOGGER.exception(
+                "Message du bot %s impossible à enregistrer pour le nettoyage de séance",
+                message_id,
+            )
+            try:
+                self.api.delete_message(self.config.target_chat_id, message_id)
+            except TelegramAPIError:
+                LOGGER.exception("Impossible de supprimer le message du bot non enregistré %s", message_id)
+            raise
+
+    def _send_group_message(
+        self,
+        text: str,
+        *,
+        reply_markup: dict[str, Any] | None = None,
+        session_key: str | None = None,
+    ) -> dict[str, Any]:
+        with self._scheduler_lock:
+            tracked_session = session_key or self._current_session_key()
+            result = self.api.send_message(
+                self.config.target_chat_id,
+                text,
+                reply_markup=reply_markup,
+            )
+            self._remember_sent_group_message(tracked_session, int(result["message_id"]))
+            return result
+
+    def _send_group_photo(
+        self,
+        photo: str,
+        *,
+        caption: str = "",
+        reply_markup: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        with self._scheduler_lock:
+            session_key = self._current_session_key()
+            result = self.api.send_photo(
+                self.config.target_chat_id,
+                photo,
+                caption=caption,
+                reply_markup=reply_markup,
+            )
+            self._remember_sent_group_message(session_key, int(result["message_id"]))
+            return result
+
+    def _cleanup_closed_sessions(self, active_session_key: str | None) -> bool:
+        with self._scheduler_lock:
+            return self._cleanup_closed_sessions_locked(active_session_key)
+
+    def _cleanup_closed_sessions_locked(self, active_session_key: str | None) -> bool:
+        cleanup_pending = False
+        for session_key in self.storage.list_session_keys():
+            if session_key == active_session_key:
+                continue
+            message_ids = self.storage.list_session_message_ids(session_key)
+            completed: list[int] = []
+            for index in range(0, len(message_ids), 100):
+                chunk = message_ids[index : index + 100]
+                try:
+                    self.api.delete_messages(self.config.target_chat_id, chunk)
+                    completed.extend(chunk)
+                    continue
+                except TelegramAPIError as exc:
+                    LOGGER.warning(
+                        "Suppression groupée impossible pour la séance %s, nouvelle tentative message par message : %s",
+                        session_key,
+                        exc,
+                    )
+
+                for message_id in chunk:
+                    try:
+                        self.api.delete_message(self.config.target_chat_id, message_id)
+                        completed.append(message_id)
+                    except TelegramAPIError as exc:
+                        if exc.error_code == 400:
+                            completed.append(message_id)
+                        else:
+                            cleanup_pending = True
+                            LOGGER.warning(
+                                "Message %s de la séance %s impossible à supprimer : %s",
+                                message_id,
+                                session_key,
+                                exc,
+                            )
+
+            self.storage.forget_session_message_ids(session_key, completed)
+            remaining = len(message_ids) - len(completed)
+            if remaining:
+                cleanup_pending = True
+            else:
+                LOGGER.info(
+                    "Nettoyage de la séance %s terminé : %s message(s) supprimé(s)",
+                    session_key,
+                    len(completed),
+                )
+        return cleanup_pending
+
     def _handle_callback(self, query: dict[str, Any]) -> None:
         query_id = str(query["id"])
         user_id = int((query.get("from") or {}).get("id", 0))
@@ -732,13 +848,16 @@ class GroupManagerService:
             self._pending_inputs.pop(user_id, None)
             self._show_panel(chat_id, message_id)
         elif data == "toggle:auto":
-            enabled = self.storage.toggle("auto_open")
-            if not enabled:
-                self._clear_countdown()
-                self._apply_permissions(False, force=True)
-                self.api.send_message(self.config.target_chat_id, self._no_opening_message())
-            else:
-                self._scheduler_tick(force=True, force_countdown=True)
+            with self._scheduler_lock:
+                enabled = self.storage.toggle("auto_open")
+                if not enabled:
+                    self._clear_countdown()
+                    self._apply_permissions(False, force=True)
+                    self._session_cleanup_pending = self._cleanup_closed_sessions(None)
+                    self._last_effective_open = False
+                    self._send_group_message(self._no_opening_message())
+                else:
+                    self._scheduler_tick(force=True, force_countdown=True)
             self._show_panel(chat_id, message_id)
         elif data == "toggle:links":
             self.storage.toggle("links_forbidden")
@@ -809,8 +928,7 @@ class GroupManagerService:
             if error:
                 self.api.send_message(chat_id, error)
             else:
-                self.api.send_photo(
-                    self.config.target_chat_id,
+                self._send_group_photo(
                     self.storage.get("invitation_ad_photo_id"),
                     caption=self.storage.get("invitation_ad_text"),
                     reply_markup=invitation_publication_keyboard(self._bot_username),
@@ -846,7 +964,7 @@ class GroupManagerService:
         elif data == "rules:publish":
             rules = self.storage.get("rules_text").strip()
             if rules:
-                self.api.send_message(self.config.target_chat_id, rules)
+                self._send_group_message(rules)
                 self._edit_message(chat_id, message_id, "Les règles ont été publiées dans le groupe.", rules_keyboard())
             else:
                 self._edit_message(chat_id, message_id, "Aucune règle n’est encore configurée.", rules_keyboard())
@@ -1030,6 +1148,11 @@ class GroupManagerService:
             if force or time_module.monotonic() - self._last_admin_refresh >= 300:
                 self._refresh_group_admins(strict=False)
             self._apply_permissions(is_open_now, links_forbidden=links_forbidden, force=force)
+            active_session_key = schedule.session_key(now) if is_open_now else None
+            transitioned_to_closed = self._last_effective_open is True and not is_open_now
+            if force or transitioned_to_closed or self._session_cleanup_pending:
+                self._session_cleanup_pending = self._cleanup_closed_sessions(active_session_key)
+            self._last_effective_open = is_open_now
 
             if time_module.monotonic() - self._last_prune >= 86400:
                 self.storage.prune_events()
@@ -1109,12 +1232,13 @@ class GroupManagerService:
             f"open:{session_key}",
             f"🟢 Le groupe est ouvert jusqu’à {format_hhmm(schedule.closes_at)}. "
             "Seuls les messages, les photos et les vidéos sont autorisés.",
+            session_key,
         )
 
         rules = self.storage.get("rules_text").strip()
         rules_slot = current_rules_slot(now, schedule)
         if rules and rules_slot:
-            self._send_event(f"rules:{session_key}:{rules_slot}", rules)
+            self._send_event(f"rules:{session_key}:{rules_slot}", rules, session_key)
 
         threshold = closing_warning_threshold(now, end)
         if threshold:
@@ -1122,13 +1246,14 @@ class GroupManagerService:
             self._send_event(
                 f"closing-warning:{session_key}:{threshold}",
                 f"⚠️ Le groupe fermera dans {actual_minutes} minute{'s' if actual_minutes > 1 else ''}.",
+                session_key,
             )
 
-    def _send_event(self, event_key: str, text: str) -> None:
+    def _send_event(self, event_key: str, text: str, session_key: str) -> None:
         if not self.storage.claim_event(event_key):
             return
         try:
-            self.api.send_message(self.config.target_chat_id, text)
+            self._send_group_message(text, session_key=session_key)
         except Exception:
             self.storage.release_event(event_key)
             raise

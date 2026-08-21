@@ -144,6 +144,14 @@ class PostgresStorage:
                 confirmed_at TIMESTAMPTZ NOT NULL
             )
             """,
+            """
+            CREATE TABLE IF NOT EXISTS session_messages (
+                session_key TEXT NOT NULL,
+                message_id BIGINT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL,
+                PRIMARY KEY(session_key, message_id)
+            )
+            """,
         )
         with self._transaction() as connection:
             for statement in statements:
@@ -489,6 +497,42 @@ class PostgresStorage:
             )
         return cursor.rowcount == 1
 
+    def record_session_message(self, session_key: str, message_id: int) -> None:
+        with self._transaction() as connection:
+            connection.execute(
+                "INSERT INTO session_messages(session_key, message_id, created_at) "
+                "VALUES (%s, %s, %s) ON CONFLICT(session_key, message_id) DO NOTHING",
+                (session_key, message_id, datetime.now(timezone.utc)),
+            )
+
+    def list_session_keys(self) -> list[str]:
+        with self._transaction() as connection:
+            rows = connection.execute(
+                "SELECT session_key FROM session_messages "
+                "GROUP BY session_key ORDER BY MIN(created_at)"
+            ).fetchall()
+        return [str(row[0]) for row in rows]
+
+    def list_session_message_ids(self, session_key: str) -> list[int]:
+        with self._transaction() as connection:
+            rows = connection.execute(
+                "SELECT message_id FROM session_messages "
+                "WHERE session_key = %s ORDER BY message_id",
+                (session_key,),
+            ).fetchall()
+        return [int(row[0]) for row in rows]
+
+    def forget_session_message_ids(self, session_key: str, message_ids: list[int]) -> None:
+        unique_ids = sorted(set(message_ids))
+        if not unique_ids:
+            return
+        with self._transaction() as connection:
+            connection.execute(
+                "DELETE FROM session_messages WHERE session_key = %s "
+                "AND message_id = ANY(%s)",
+                (session_key, unique_ids),
+            )
+
     def claim_event(self, event_key: str) -> bool:
         with self._transaction() as connection:
             cursor = connection.execute(
@@ -510,6 +554,7 @@ class PostgresStorage:
             connection.execute("DELETE FROM media_group_messages WHERE created_at < %s", (cutoff,))
             connection.execute("DELETE FROM popular_justice_votes WHERE created_at < %s", (cutoff,))
             connection.execute("DELETE FROM referral_pending WHERE requested_at < %s", (cutoff,))
+            connection.execute("DELETE FROM session_messages WHERE created_at < %s", (cutoff,))
             case_cutoff = datetime.now(timezone.utc) - timedelta(days=30)
             connection.execute(
                 "DELETE FROM popular_justice_cases WHERE resolved_at < %s",
