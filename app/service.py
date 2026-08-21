@@ -60,6 +60,7 @@ POPULAR_THRESHOLD_MAX = 50
 REFERRAL_REQUIRED_COUNT = 10
 REFERRAL_STAY_SECONDS = 600
 REFERRAL_CHECK_INTERVAL = 30
+REFERRAL_LINK_REFRESH_BATCH = 10
 INVITATION_AD_TEXT_MAX = 1000
 
 
@@ -82,6 +83,7 @@ class GroupManagerService:
         self.health_server = HealthServer(config.port, self.health_payload)
         self.stop_event = threading.Event()
         self._scheduler_lock = threading.RLock()
+        self._referral_lock = threading.RLock()
         self._admin_lock = threading.RLock()
         self._group_admin_ids: set[int] = set(config.admin_ids)
         self._pending_inputs: dict[int, PendingInput] = {}
@@ -91,6 +93,7 @@ class GroupManagerService:
         self._last_admin_refresh = 0.0
         self._last_prune = 0.0
         self._last_referral_check = 0.0
+        self._referral_refresh_pending = False
         self._last_effective_open: bool | None = None
         self._session_cleanup_pending = False
         self._last_update_at: datetime | None = None
@@ -136,6 +139,8 @@ class GroupManagerService:
                     f"Détail Telegram : {exc.description}"
                 ) from exc
 
+            self._prepare_referral_links_for_target()
+
             self.health_server.start()
             self._scheduler_thread = threading.Thread(
                 target=self._scheduler_loop,
@@ -170,8 +175,20 @@ class GroupManagerService:
             ) from exc
         if chat.get("type") not in {"group", "supergroup"}:
             raise StartupError("TARGET_CHAT_ID doit désigner un groupe ou un supergroupe Telegram.")
-        if not self._invite_link_cache:
-            self._invite_link_cache = str(chat.get("invite_link") or "")
+        live_invite_link = str(chat.get("invite_link") or "")
+        if live_invite_link:
+            # Le lien retourné par Telegram appartient nécessairement au groupe
+            # courant. Il doit primer sur une ancienne variable Railway.
+            self._invite_link_cache = live_invite_link
+
+    def _prepare_referral_links_for_target(self) -> None:
+        queued = self.storage.enqueue_stale_referral_link_refreshes(self.config.target_chat_id)
+        self._referral_refresh_pending = self.storage.pending_referral_link_refresh_count() > 0
+        if queued:
+            LOGGER.info(
+                "%s lien(s) personnel(s) appartiennent à un ancien groupe et seront renouvelés",
+                queued,
+            )
 
     def _validate_bot_rights(self, admins: list[dict[str, Any]] | None = None) -> None:
         if self._bot_id is None:
@@ -275,29 +292,30 @@ class GroupManagerService:
             self._consume_pending_input(user_id, message, pending)
 
     def _send_personal_referral_link(self, user_id: int, chat_id: int) -> None:
-        profile = self.storage.get_referral_profile(user_id)
-        if profile:
-            invite_link, confirmed_count, _ = profile
-        else:
-            try:
-                result = self.api.create_chat_invite_link(
-                    self.config.target_chat_id,
-                    name=f"parrain-{user_id}",
-                    creates_join_request=True,
-                )
-            except TelegramAPIError:
-                LOGGER.exception("Impossible de créer le lien personnel de %s", user_id)
-                self.api.send_message(
-                    chat_id,
-                    "Impossible de créer votre lien pour le moment. Réessayez un peu plus tard.",
-                )
-                return
-            invite_link = str(result.get("invite_link") or "")
-            if not invite_link:
-                self.api.send_message(chat_id, "Telegram n’a pas retourné de lien d’invitation.")
-                return
-            self.storage.save_referral_link(user_id, invite_link)
-            confirmed_count = 0
+        with self._referral_lock:
+            profile = self.storage.get_referral_profile(user_id)
+            if profile and profile[3] == self.config.target_chat_id:
+                invite_link, confirmed_count, _, _ = profile
+            else:
+                confirmed_count = profile[1] if profile else 0
+                try:
+                    result = self.api.create_chat_invite_link(
+                        self.config.target_chat_id,
+                        name=f"parrain-{user_id}",
+                        creates_join_request=True,
+                    )
+                except TelegramAPIError:
+                    LOGGER.exception("Impossible de créer le lien personnel de %s", user_id)
+                    self.api.send_message(
+                        chat_id,
+                        "Impossible de créer votre lien pour le moment. Réessayez un peu plus tard.",
+                    )
+                    return
+                invite_link = str(result.get("invite_link") or "")
+                if not invite_link:
+                    self.api.send_message(chat_id, "Telegram n’a pas retourné de lien d’invitation.")
+                    return
+                self.storage.save_referral_link(user_id, invite_link, self.config.target_chat_id)
 
         self.api.send_message(
             chat_id,
@@ -318,7 +336,12 @@ class GroupManagerService:
             int(request.get("date") or datetime.now(timezone.utc).timestamp()),
             timezone.utc,
         )
-        self.storage.record_referral_request(candidate_user_id, invite_link, requested_at)
+        self.storage.record_referral_request(
+            candidate_user_id,
+            invite_link,
+            requested_at,
+            chat_id,
+        )
 
     def _handle_chat_member_update(self, update: dict[str, Any]) -> None:
         chat_id = int((update.get("chat") or {}).get("id", 0))
@@ -911,6 +934,24 @@ class GroupManagerService:
                 "Envoyez le lien Telegram du groupe de récompense.\n\nUtilisez /cancel pour annuler.",
                 cancel_keyboard(),
             )
+        elif data == "invite_ad:refresh_links":
+            with self._referral_lock:
+                queued = self.storage.enqueue_all_referral_link_refreshes()
+                self._referral_refresh_pending = (
+                    self.storage.pending_referral_link_refresh_count() > 0
+                )
+            if queued:
+                self.api.send_message(
+                    chat_id,
+                    f"🔄 Renouvellement lancé pour {queued} membre{'s' if queued > 1 else ''}. "
+                    "Les nouveaux liens seront créés et envoyés progressivement en message privé.",
+                )
+            else:
+                self.api.send_message(
+                    chat_id,
+                    "Aucun membre ne possède encore de lien personnel à renouveler.",
+                )
+            self._show_invitation_ad_menu(chat_id, message_id)
         elif data == "invite_ad:preview":
             error = self._invitation_ad_configuration_error(require_reward=False)
             if error:
@@ -1060,11 +1101,13 @@ class GroupManagerService:
         ad_text = self.storage.get("invitation_ad_text").strip()
         photo_id = self.storage.get("invitation_ad_photo_id").strip()
         reward_link = self.storage.get("referral_reward_link").strip()
+        pending_links = self.storage.pending_referral_link_refresh_count()
         text = (
             "Publicité d’invitation\n\n"
             f"Texte : {'configuré' if ad_text else 'manquant'}\n"
             f"Photo : {'configurée' if photo_id else 'manquante'}\n"
             f"Lien de récompense : {'configuré' if reward_link else 'manquant'}\n\n"
+            f"Liens personnels en attente de renouvellement : {pending_links}\n\n"
             "Une seule publicité est conservée : toute modification remplace la précédente."
         )
         self._edit_message(chat_id, message_id, text, invitation_ad_keyboard())
@@ -1163,6 +1206,9 @@ class GroupManagerService:
                 self._process_referral_rewards()
                 self._last_referral_check = time_module.monotonic()
 
+            if self._referral_refresh_pending:
+                self._process_referral_link_refreshes()
+
             if not auto_open:
                 self._clear_countdown()
                 return
@@ -1195,6 +1241,65 @@ class GroupManagerService:
             result = self.storage.confirm_referral(candidate_user_id, cutoff)
             if result:
                 self._notify_referral_confirmation(*result)
+
+    def _process_referral_link_refreshes(self) -> None:
+        with self._referral_lock:
+            inviter_ids = self.storage.due_referral_link_refreshes(
+                REFERRAL_LINK_REFRESH_BATCH
+            )
+            for inviter_id in inviter_ids:
+                profile = self.storage.get_referral_profile(inviter_id)
+                if not profile:
+                    continue
+                confirmed_count = profile[1]
+                try:
+                    result = self.api.create_chat_invite_link(
+                        self.config.target_chat_id,
+                        name=f"parrain-{inviter_id}",
+                        creates_join_request=True,
+                    )
+                except TelegramAPIError as exc:
+                    self.storage.defer_referral_link_refresh(inviter_id)
+                    LOGGER.warning(
+                        "Lien personnel de %s impossible à renouveler, nouvelle tentative différée : %s",
+                        inviter_id,
+                        exc,
+                    )
+                    continue
+
+                invite_link = str(result.get("invite_link") or "")
+                if not invite_link:
+                    self.storage.defer_referral_link_refresh(inviter_id)
+                    LOGGER.warning(
+                        "Telegram n’a retourné aucun lien lors du renouvellement de %s",
+                        inviter_id,
+                    )
+                    continue
+
+                self.storage.save_referral_link(
+                    inviter_id,
+                    invite_link,
+                    self.config.target_chat_id,
+                )
+                try:
+                    self.api.send_message(
+                        inviter_id,
+                        "🔄 Le groupe a changé : voici votre nouveau lien personnel "
+                        "d’invitation :\n"
+                        f"{invite_link}\n\n"
+                        f"Invitations validées : {confirmed_count}/{REFERRAL_REQUIRED_COUNT}",
+                    )
+                except TelegramAPIError:
+                    # Le lien reste enregistré et sera affiché au prochain clic,
+                    # même si Telegram refuse actuellement le message privé.
+                    LOGGER.warning(
+                        "Nouveau lien de %s enregistré, mais message privé impossible",
+                        inviter_id,
+                    )
+
+            self._referral_refresh_pending = (
+                self.storage.pending_referral_link_refresh_count() > 0
+            )
 
     def _notify_referral_confirmation(self, inviter_id: int, confirmed_count: int) -> None:
         try:

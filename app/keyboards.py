@@ -104,6 +104,7 @@ def invitation_ad_keyboard() -> dict[str, Any]:
             [_button("Modifier le texte", "invite_ad:text"), _button("Modifier la photo", "invite_ad:photo")],
             [_button("Lien de récompense", "invite_ad:reward")],
             [_button("Aperçu", "invite_ad:preview"), _button("Publier", "invite_ad:publish")],
+            [_button("🔄 Nouveaux liens pour tous", "invite_ad:refresh_links")],
             [_button("⬅️ Retour", "panel")],
         ]
     }

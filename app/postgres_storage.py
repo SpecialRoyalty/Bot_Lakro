@@ -124,8 +124,19 @@ class PostgresStorage:
             CREATE TABLE IF NOT EXISTS referral_profiles (
                 inviter_id BIGINT PRIMARY KEY,
                 invite_link TEXT NOT NULL UNIQUE,
+                chat_id BIGINT,
                 confirmed_count INTEGER NOT NULL DEFAULT 0,
                 rewarded_at TIMESTAMPTZ
+            )
+            """,
+            """
+            ALTER TABLE referral_profiles ADD COLUMN IF NOT EXISTS chat_id BIGINT
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS referral_link_refresh_queue (
+                inviter_id BIGINT PRIMARY KEY,
+                next_attempt_at TIMESTAMPTZ NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0
             )
             """,
             """
@@ -367,35 +378,108 @@ class PostgresStorage:
         with self._transaction() as connection:
             connection.execute("DELETE FROM popular_justice_votes")
 
-    def get_referral_profile(self, inviter_id: int) -> tuple[str, int, bool] | None:
+    def get_referral_profile(self, inviter_id: int) -> tuple[str, int, bool, int | None] | None:
         with self._transaction() as connection:
             row = connection.execute(
-                "SELECT invite_link, confirmed_count, rewarded_at "
+                "SELECT invite_link, confirmed_count, rewarded_at, chat_id "
                 "FROM referral_profiles WHERE inviter_id = %s",
                 (inviter_id,),
             ).fetchone()
         if not row:
             return None
-        return str(row[0]), int(row[1]), row[2] is not None
+        return str(row[0]), int(row[1]), row[2] is not None, int(row[3]) if row[3] is not None else None
 
-    def save_referral_link(self, inviter_id: int, invite_link: str) -> None:
+    def save_referral_link(self, inviter_id: int, invite_link: str, chat_id: int) -> None:
         with self._transaction() as connection:
             connection.execute(
-                "INSERT INTO referral_profiles(inviter_id, invite_link, confirmed_count) "
-                "VALUES (%s, %s, 0) ON CONFLICT(inviter_id) DO UPDATE SET invite_link = EXCLUDED.invite_link",
+                "DELETE FROM referral_pending WHERE inviter_id = %s AND invite_link <> %s",
                 (inviter_id, invite_link),
             )
+            connection.execute(
+                "INSERT INTO referral_profiles(inviter_id, invite_link, chat_id, confirmed_count) "
+                "VALUES (%s, %s, %s, 0) ON CONFLICT(inviter_id) DO UPDATE SET "
+                "invite_link = EXCLUDED.invite_link, chat_id = EXCLUDED.chat_id",
+                (inviter_id, invite_link, chat_id),
+            )
+            connection.execute(
+                "DELETE FROM referral_link_refresh_queue WHERE inviter_id = %s",
+                (inviter_id,),
+            )
+
+    def enqueue_all_referral_link_refreshes(self) -> int:
+        now = datetime.now(timezone.utc)
+        with self._transaction() as connection:
+            rows = connection.execute(
+                "SELECT inviter_id FROM referral_profiles ORDER BY inviter_id"
+            ).fetchall()
+            with connection.cursor() as cursor:
+                cursor.executemany(
+                    "INSERT INTO referral_link_refresh_queue(inviter_id, next_attempt_at, attempts) "
+                    "VALUES (%s, %s, 0) ON CONFLICT(inviter_id) DO UPDATE SET "
+                    "next_attempt_at = EXCLUDED.next_attempt_at, attempts = 0",
+                    [(int(row[0]), now) for row in rows],
+                )
+        return len(rows)
+
+    def enqueue_stale_referral_link_refreshes(self, chat_id: int) -> int:
+        now = datetime.now(timezone.utc)
+        with self._transaction() as connection:
+            rows = connection.execute(
+                "SELECT inviter_id FROM referral_profiles "
+                "WHERE chat_id IS NULL OR chat_id <> %s ORDER BY inviter_id",
+                (chat_id,),
+            ).fetchall()
+            inviter_ids = [int(row[0]) for row in rows]
+            if inviter_ids:
+                connection.execute(
+                    "DELETE FROM referral_pending WHERE inviter_id = ANY(%s)",
+                    (inviter_ids,),
+                )
+                with connection.cursor() as cursor:
+                    cursor.executemany(
+                        "INSERT INTO referral_link_refresh_queue(inviter_id, next_attempt_at, attempts) "
+                        "VALUES (%s, %s, 0) ON CONFLICT(inviter_id) DO UPDATE SET "
+                        "next_attempt_at = EXCLUDED.next_attempt_at, attempts = 0",
+                        [(inviter_id, now) for inviter_id in inviter_ids],
+                    )
+        return len(inviter_ids)
+
+    def due_referral_link_refreshes(self, limit: int = 10) -> list[int]:
+        with self._transaction() as connection:
+            rows = connection.execute(
+                "SELECT inviter_id FROM referral_link_refresh_queue "
+                "WHERE next_attempt_at <= %s ORDER BY next_attempt_at, inviter_id LIMIT %s",
+                (datetime.now(timezone.utc), limit),
+            ).fetchall()
+        return [int(row[0]) for row in rows]
+
+    def defer_referral_link_refresh(self, inviter_id: int, delay_seconds: int = 300) -> None:
+        next_attempt = datetime.now(timezone.utc) + timedelta(seconds=delay_seconds)
+        with self._transaction() as connection:
+            connection.execute(
+                "UPDATE referral_link_refresh_queue SET attempts = attempts + 1, next_attempt_at = %s "
+                "WHERE inviter_id = %s",
+                (next_attempt, inviter_id),
+            )
+
+    def pending_referral_link_refresh_count(self) -> int:
+        with self._transaction() as connection:
+            row = connection.execute(
+                "SELECT COUNT(*) FROM referral_link_refresh_queue"
+            ).fetchone()
+        return int(row[0]) if row else 0
 
     def record_referral_request(
         self,
         candidate_user_id: int,
         invite_link: str,
         requested_at: datetime,
+        chat_id: int,
     ) -> bool:
         with self._transaction() as connection:
             profile = connection.execute(
-                "SELECT inviter_id FROM referral_profiles WHERE invite_link = %s",
-                (invite_link,),
+                "SELECT inviter_id FROM referral_profiles WHERE invite_link = %s AND chat_id = %s",
+                (invite_link, chat_id),
             ).fetchone()
             if not profile:
                 return False
