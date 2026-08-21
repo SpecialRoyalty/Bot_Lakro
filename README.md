@@ -7,6 +7,7 @@ Bot autonome, prêt à être déployé sur Railway. Il utilise directement l’A
 - Ouverture automatique quotidienne, par défaut de **23 h à 2 h** (`Europe/Paris`).
 - Le bouton automatique peut être mis sur `OFF` à tout moment, y compris pendant une séance : le groupe est verrouillé avant la publication du message d’annulation.
 - Fermeture renforcée : les permissions Telegram sont réappliquées toutes les 60 secondes et tout message non administrateur reçu hors horaires est supprimé.
+- Nettoyage complet à la fermeture : tous les messages reçus pendant la séance, y compris ceux des administrateurs et les annonces du bot, sont enregistrés puis supprimés par lots de 100.
 - Suppression automatique des messages de service indiquant qu’un membre est entré dans le groupe ou l’a quitté.
 - Pendant l’ouverture, seuls les **messages texte, photos et vidéos** sont conservés. Les autres contenus sont supprimés.
 - Compte à rebours envoyé chaque heure, puis toutes les 15 minutes pendant la dernière heure. Le message précédent est supprimé.
@@ -22,7 +23,7 @@ Bot autonome, prêt à être déployé sur Railway. Il utilise directement l’A
 - Story partagée : suppression et bannissement immédiat.
 - Mots interdits configurables : 1 jour de restriction, 3 jours en cas de récidive, puis bannissement.
 - Règles configurables, publiées trois fois pendant chaque séance. Avec l’horaire 23 h–2 h, elles sont publiées vers 23 h, 0 h et 1 h.
-- Horaires disponibles dans le panneau : 22 h–0 h, 23 h–1 h, 23 h–2 h et 0 h–3 h.
+- Horaires disponibles dans le panneau : **10 h–10 h 30 (test)**, 22 h–0 h, 23 h–1 h, 23 h–2 h et 0 h–3 h.
 - Données persistantes dans PostgreSQL : options, horaires, règles, mots interdits, récidives, votes populaires et rappels déjà envoyés.
 - Runtime léger : une seule connexion PostgreSQL, paramètres de modération conservés en mémoire et aucune utilisation du GPU.
 - Point de contrôle Railway : `GET /health`.
@@ -107,7 +108,7 @@ Quand l’ouverture automatique passe sur `OFF`, le groupe est fermé immédiate
 > Aucune ouverture n’est prévue aujourd’hui. Revenez demain et partagez le groupe :  
 > lien principal du groupe
 
-Tous les nouveaux messages, photos ou vidéos envoyés par des membres ordinaires après ce passage sur `OFF` sont supprimés. L’API Telegram ne permet pas à un bot de relire librement tout l’historique du groupe : cette suppression concerne donc les contenus reçus par le bot au moment de la fermeture ou après celle-ci, et non d’anciens médias déjà présents avant son démarrage.
+Tous les messages de la séance sont supprimés immédiatement après le verrouillage, puis tout nouveau message d’un membre ordinaire est supprimé. Les identifiants sont conservés dans PostgreSQL : un redémarrage du bot pendant la séance ne fait pas perdre la liste à nettoyer. L’API Telegram ne permet toutefois pas au bot de relire librement l’ancien historique : les messages publiés avant l’installation de cette version ne peuvent pas être retrouvés rétroactivement.
 
 ## Publicité d’invitation et récompense
 
@@ -158,6 +159,7 @@ Les votes, les albums suivis et les récidives `/pasfr` sont enregistrés dans P
 - Si une personne ouvre manuellement le groupe hors horaires, le bot le referme au plus tard lors de la prochaine vérification (60 secondes). Les messages reçus entre-temps sont aussi supprimés.
 - Si Telegram ne répond pas pendant la vérification du statut d’un membre, le contenu interdit est supprimé par sécurité, mais aucun bannissement ni restriction irréversible n’est appliqué sans confirmation.
 - Si le processus redémarre pendant une séance, les rappels déjà enregistrés ne sont pas renvoyés en double.
+- Si Telegram échoue temporairement pendant le nettoyage, seuls les identifiants réellement supprimés sont retirés de PostgreSQL et le reste est retenté toutes les 10 secondes.
 - Le bot vérifie une dernière fois qu’un utilisateur n’est pas administrateur Telegram avant toute sanction irréversible.
 
 ## Dépannage : `Telegram getChat: 400 Bad Request: chat not found`
@@ -184,7 +186,7 @@ Exécutez les tests :
 python -m unittest discover -v
 ```
 
-La suite contient **68 tests** et vérifie notamment les **1 024 combinaisons** des règles de modération, les quatre créneaux horaires, le passage à minuit, les trusted IDs, les commandes non autorisées, les quatre niveaux `/pasfr`, les votes distincts, les albums, les administrateurs protégés, le bouton `OFF` pendant une séance, les échecs temporaires de Telegram ainsi que la publicité, les liens personnels, la validation des adhésions, les compteurs et l’envoi unique de la récompense.
+La suite contient **73 tests** et vérifie notamment les **1 024 combinaisons** des règles de modération, les cinq créneaux horaires, dont le test de 30 minutes, le passage à minuit, les trusted IDs, les commandes non autorisées, les quatre niveaux `/pasfr`, les votes distincts, les albums, les administrateurs protégés, les fermetures automatique et manuelle, le nettoyage persistant et ses nouvelles tentatives, les échecs temporaires de Telegram ainsi que la publicité, les liens personnels, la validation des adhésions, les compteurs et l’envoi unique de la récompense.
 
 En local, si `DATABASE_URL` est absent, le bot utilise SQLite avec `DATABASE_PATH`. Sur Railway, PostgreSQL est automatiquement prioritaire dès que `DATABASE_URL` est présent.
 
