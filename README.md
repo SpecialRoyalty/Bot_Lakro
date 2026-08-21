@@ -18,6 +18,8 @@ Bot autonome, prêt à être déployé sur Railway. Il utilise directement l’A
 - Justice populaire activable/désactivable avec seuil configurable, fixé à **5 comptes distincts** par défaut.
 - Publicité d’invitation unique (texte et photo), modifiable et publiable depuis le panneau.
 - Parrainage par lien personnel avec demandes d’adhésion, compteur persistant et récompense automatique à **10 invitations validées**.
+- Chaque lien personnel est associé à `TARGET_CHAT_ID` : après un changement de groupe, un ancien lien n’est jamais réutilisé.
+- Renouvellement automatique des liens devenus obsolètes et bouton administrateur **Nouveaux liens pour tous** avec envoi privé progressif.
 - Lien interdit : suppression et bannissement immédiat de l’auteur.
 - Message transféré interdit : suppression sans sanction.
 - Story partagée : suppression et bannissement immédiat.
@@ -100,6 +102,7 @@ Railway documente cette connexion ici : [PostgreSQL sur Railway](https://docs.ra
    - `Mots interdits` → Voir, Ajouter ou Supprimer ;
    - `Règles` → Voir/Modifier ou Publier maintenant ;
    - `Pub invitation` → modifier le texte, la photo et le lien du groupe de récompense, prévisualiser puis publier ;
+   - `Pub invitation` → `Nouveaux liens pour tous` pour recréer les liens personnels et les renvoyer progressivement aux membres concernés ;
    - `Horaires` → choisir un créneau ;
    - `Resynchroniser` → réappliquer immédiatement les permissions et actualiser les administrateurs Telegram.
 
@@ -121,6 +124,17 @@ Lorsqu’un membre utilise ce bouton :
 3. Lorsqu’une personne rejoint avec ce lien, est acceptée et satisfait à la validation interne, le compteur du parrain augmente une seule fois.
 4. Le parrain reçoit une notification privée indiquant son nouveau compteur.
 5. À **10 invitations validées**, le bot lui envoie une seule fois le lien du groupe de récompense configuré dans le panneau.
+
+Le lien personnel enregistré contient aussi l’identifiant du groupe auquel il appartient. Si `TARGET_CHAT_ID` est remplacé, le bot met automatiquement tous les anciens profils en file de renouvellement au prochain démarrage. Un membre qui clique sur **J’invite** avant le traitement de cette file reçoit quand même immédiatement un lien du nouveau groupe. Les compteurs et les récompenses déjà acquises ne sont pas remis à zéro.
+
+Le bouton **Nouveaux liens pour tous** force le même renouvellement à la demande. Le traitement se fait par petits lots afin de garder le bot réactif et de respecter les limites d’envoi de Telegram. Si Telegram échoue temporairement, le lien concerné reste en file et sera retenté. Si un utilisateur bloque les messages privés du bot, son nouveau lien reste enregistré et lui sera affiché à son prochain clic sur **J’invite**.
+
+Lors d’un futur remplacement de groupe :
+
+1. ajoutez le bot comme administrateur du nouveau supergroupe avec les droits requis ;
+2. remplacez `TARGET_CHAT_ID` dans Railway et, si vous l’utilisez, `GROUP_INVITE_LINK` ;
+3. redéployez le service : aucune suppression manuelle dans PostgreSQL n’est nécessaire ;
+4. utilisez au besoin **Pub invitation → Nouveaux liens pour tous** pour relancer immédiatement l’envoi collectif.
 
 Le délai et les contrôles de validation restent internes au bot et ne sont jamais indiqués dans ses messages publics ou privés. Un départ avant validation annule l’invitation en attente. Une même personne ne peut jamais être comptée deux fois, même après un redémarrage.
 
@@ -186,7 +200,7 @@ Exécutez les tests :
 python -m unittest discover -v
 ```
 
-La suite contient **73 tests** et vérifie notamment les **1 024 combinaisons** des règles de modération, les cinq créneaux horaires, dont le test de 30 minutes, le passage à minuit, les trusted IDs, les commandes non autorisées, les quatre niveaux `/pasfr`, les votes distincts, les albums, les administrateurs protégés, les fermetures automatique et manuelle, le nettoyage persistant et ses nouvelles tentatives, les échecs temporaires de Telegram ainsi que la publicité, les liens personnels, la validation des adhésions, les compteurs et l’envoi unique de la récompense.
+La suite contient **80 tests** et vérifie notamment les **1 024 combinaisons** des règles de modération, les cinq créneaux horaires, dont le test de 30 minutes, le passage à minuit, les trusted IDs, les commandes non autorisées, les quatre niveaux `/pasfr`, les votes distincts, les albums, les administrateurs protégés, les fermetures automatique et manuelle, le nettoyage persistant et ses nouvelles tentatives, les échecs temporaires de Telegram ainsi que la publicité, les liens personnels associés au bon groupe, leur renouvellement collectif, la migration des anciennes données, la validation des adhésions, les compteurs et l’envoi unique de la récompense.
 
 En local, si `DATABASE_URL` est absent, le bot utilise SQLite avec `DATABASE_PATH`. Sur Railway, PostgreSQL est automatiquement prioritaire dès que `DATABASE_URL` est présent.
 
